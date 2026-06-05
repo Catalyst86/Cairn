@@ -1,0 +1,19 @@
+# Cairn OS — workspace root.
+# Host-verifiable library crates live here (verified with Kani on the host).
+# The bare-metal kernel (`kernel/`) is built SEPARATELY against a custom target;
+# see README.md. It is intentionally NOT a workspace member so `cargo test` /
+# `cargo kani` at the root stay on the host toolchain.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["James", "Claude Code (Anthropic)", "Grok Build (xAI)"]
+repository = "local:Cairn"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

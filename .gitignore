@@ -1,0 +1,14 @@
+/target
+**/target
+Cargo.lock.bak
+# Build artifacts / boot images
+*.iso
+*.img
+*.hdd
+*.elf
+# Firmware blobs fetched at build time
+ovmf/
+/firmware/
+# Logs & scratch
+*.log
+.DS_Store

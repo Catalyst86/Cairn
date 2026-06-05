@@ -1,0 +1,22 @@
+[package]
+name = "keystone"
+version = "0.1.0"
+edition = "2021"
+description = "Cairn keystone bare-metal microkernel (Limine + serial)"
+publish = false
+
+[[bin]]
+name = "keystone"
+path = "src/main.rs"
+
+[dependencies]
+limine = "0.3"
+cap-core = { path = "../crates/cap-core" }
+spin = "0.9"
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+opt-level = "z"
+codegen-units = 1
+strip = true

@@ -1,0 +1,7 @@
+# Pinned nightly: bare-metal OS dev needs unstable features (build-std, naked_asm,
+# custom targets). `rust-src` is required to cross-compile core/alloc for the kernel.
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "llvm-tools", "rustfmt", "clippy"]
+targets = ["x86_64-unknown-none"]
+profile = "minimal"
