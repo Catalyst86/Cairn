@@ -28,6 +28,7 @@ bitflags! {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ObjectKind(u16);
 
+#[allow(non_upper_case_globals)]
 impl ObjectKind {
     pub const Null: Self = Self(0);
     pub const Untyped: Self = Self(1);

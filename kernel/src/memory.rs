@@ -22,11 +22,9 @@
 //! comes in a later phase.)
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use limine::response::MemoryMapResponse;
-use limine::MemoryMapEntryType;
+use limine::memmap::MEMMAP_USABLE;
+use limine::request::MemmapResponse;
 use spin::Mutex;
-
-use crate::serial_println;
 
 /// Higher-half direct map offset reported by Limine (phys -> virt).
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
@@ -226,13 +224,13 @@ static FRAME_ALLOCATOR: Mutex<FrameAllocator> = Mutex::new(FrameAllocator::empty
 
 /// Initialize the frame allocator from Limine's usable memory map entries.
 /// Also records the HHDM offset.
-pub fn init(hhdm_offset: u64, memmap: &MemoryMapResponse) {
+pub fn init(hhdm_offset: u64, memmap: &MemmapResponse) {
     {
         let mut fa = FRAME_ALLOCATOR.lock();
         fa.clear();
 
         for entry in memmap.entries() {
-            if entry.entry_type != MemoryMapEntryType::Usable {
+            if entry.type_ != MEMMAP_USABLE {
                 continue;
             }
             // Convert byte range to frame range (4 KiB). Align outward for safety.
@@ -293,7 +291,7 @@ static mut HEAP_SPACE: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 pub fn init_heap() {
     // Obtain a raw pointer to the static buffer without creating intermediate refs
     // that could be invalidated by mutation.
-    let heap_start = unsafe { core::ptr::addr_of_mut!(HEAP_SPACE) as *mut u8 };
+    let heap_start = core::ptr::addr_of_mut!(HEAP_SPACE) as *mut u8;
 
     // SAFETY (documented per task requirements):
     // - The static buffer has static lifetime and is never used for anything else.

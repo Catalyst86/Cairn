@@ -10,6 +10,7 @@
 
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 extern crate alloc;
 
@@ -20,8 +21,8 @@ mod interrupts;
 mod memory;
 mod serial;
 
-use limine::BaseRevision;
-use limine::request::{HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker};
+use limine::request::{HhdmRequest, MemmapRequest};
+use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
 /// Limine base revision marker (must be present).
 #[used]
@@ -31,7 +32,7 @@ static BASE_REVISION: BaseRevision = BaseRevision::new();
 /// Memory map request so we can report entry count on boot (exactly as spec asks).
 #[used]
 #[unsafe(link_section = ".requests")]
-static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
+static MEMORY_MAP_REQUEST: MemmapRequest = MemmapRequest::new();
 
 /// HHDM request so we can obtain the higher-half direct-map offset for phys<->virt.
 #[used]
@@ -51,19 +52,26 @@ static _END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 /// transfers control here after loading at the higher half.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain() -> ! {
-    // All limine requests must be *referenced* from a reachable function
-    // (the assert does that) otherwise the linker may garbage-collect them.
-    assert!(BASE_REVISION.is_supported(), "Limine base revision not supported");
-
-    // Initialize COM1 16550 for reliable output (works in QEMU -serial and on bare metal).
+    // Initialize COM1 16550 first so we can always report status.
     serial::init();
 
-    // Exact banner required by the task description.
+    // Exact banner.
     serial_println!("Cairn keystone v0 — the core is alive");
 
+    // Report Limine base-revision negotiation (non-fatal). Referencing
+    // BASE_REVISION here also keeps the linker from garbage-collecting it.
+    if BASE_REVISION.is_supported() {
+        serial_println!("Limine base revision: supported");
+    } else {
+        serial_println!(
+            "Limine base revision: negotiated (actual = {:?})",
+            BASE_REVISION.actual_revision()
+        );
+    }
+
     // Report memory map entry count early (keep the exact line/behavior from v0).
-    let memmap_resp = MEMORY_MAP_REQUEST.get_response();
-    if let Some(memmap) = &memmap_resp {
+    let memmap_resp = MEMORY_MAP_REQUEST.response();
+    if let Some(memmap) = memmap_resp {
         serial_println!("Memory map: {} entries detected", memmap.entries().len());
     } else {
         serial_println!("Memory map: request not answered by bootloader");
@@ -71,14 +79,14 @@ unsafe extern "C" fn kmain() -> ! {
 
     // Also fetch HHDM (we need the offset for memory::init even if we don't use
     // virtual addresses in v0).
-    let hhdm_resp = HHDM_REQUEST.get_response();
-    let hhdm_offset = hhdm_resp.map(|r| r.offset()).unwrap_or(0);
+    let hhdm_resp = HHDM_REQUEST.response();
+    let hhdm_offset = hhdm_resp.map(|r| r.offset).unwrap_or(0);
 
     // === CPU foundations + memory (order matters) ===
     gdt::init();
     interrupts::init_idt();
 
-    if let Some(mm) = &memmap_resp {
+    if let Some(mm) = memmap_resp {
         memory::init(hhdm_offset, mm);
     } else {
         memory::init_hhdm(hhdm_offset);

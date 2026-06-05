@@ -6,6 +6,7 @@
 //! Only the minimal unsafe required for GDT/TSS loads and the static stack.
 
 use spin::Once;
+use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
@@ -20,6 +21,7 @@ static TSS: Once<TaskStateSegment> = Once::new();
 /// The GDT and the selectors we need later (code + TSS).
 struct GdtSelectors {
     code_selector: SegmentSelector,
+    data_selector: SegmentSelector,
     tss_selector: SegmentSelector,
 }
 
@@ -51,16 +53,17 @@ pub fn init() {
 
         // Kernel code and data segments (data is largely unused in long mode but
         // included per the conventional 64-bit GDT layout).
-        let code_selector = gdt.add_entry(Descriptor::kernel_code_segment());
-        let _data_selector = gdt.add_entry(Descriptor::kernel_data_segment());
+        let code_selector = gdt.append(Descriptor::kernel_code_segment());
+        let data_selector = gdt.append(Descriptor::kernel_data_segment());
 
         // TSS descriptor (holds a reference to the TSS we just built).
-        let tss_selector = gdt.add_entry(Descriptor::tss_segment(tss));
+        let tss_selector = gdt.append(Descriptor::tss_segment(tss));
 
         (
             gdt,
             GdtSelectors {
                 code_selector,
+                data_selector,
                 tss_selector,
             },
         )
@@ -73,7 +76,13 @@ pub fn init() {
     // SAFETY: The GDT has been loaded and the selectors are valid entries that
     // we just installed. This is the canonical way to enter the new GDT.
     unsafe {
-        x86_64::instructions::segmentation::CS::set_reg(selectors.code_selector);
+        CS::set_reg(selectors.code_selector);
         x86_64::instructions::tables::load_tss(selectors.tss_selector);
+        // Reload SS/DS/ES so they reference OUR GDT. Limine left them pointing at
+        // its own GDT; after we load ours, an iretq restoring those stale selectors
+        // (e.g. SS index 6) faults with #GP. Point them at our data segment.
+        SS::set_reg(selectors.data_selector);
+        DS::set_reg(selectors.data_selector);
+        ES::set_reg(selectors.data_selector);
     }
 }

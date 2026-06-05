@@ -10,7 +10,7 @@ name = "keystone"
 path = "src/main.rs"
 
 [dependencies]
-limine = "0.3"
+limine = "0.6"
 cap-core = { path = "../crates/cap-core" }
 spin = "0.9"
 x86_64 = "0.15"
@@ -22,3 +22,7 @@ lto = "thin"
 opt-level = "z"
 codegen-units = 1
 strip = true
+
+# keystone is built standalone (custom bare-metal target), NOT as part of the
+# root workspace. An empty [workspace] table makes this its own workspace root.
+[workspace]

@@ -67,7 +67,9 @@ extern "x86-interrupt" fn page_fault_handler(
     error_code: PageFaultErrorCode,
 ) {
     // Read CR2 (faulting virtual address) via the x86_64 crate.
-    let fault_addr = x86_64::registers::control::Cr2::read().as_u64();
+    let fault_addr = x86_64::registers::control::Cr2::read()
+        .map(|a| a.as_u64())
+        .unwrap_or(0);
 
     crate::serial_println!("EXCEPTION: PAGE FAULT");
     crate::serial_println!("  accessed address: {:#x}", fault_addr);

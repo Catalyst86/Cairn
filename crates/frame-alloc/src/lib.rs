@@ -16,18 +16,28 @@
 
 #![no_std]
 #![forbid(unsafe_code)]
+// The bitmap word array is sized by a const expression of the FRAMES const
+// generic; that requires this (nightly) feature.
+#![feature(generic_const_exprs)]
+#![allow(incomplete_features)]
 
 /// A fixed-capacity frame allocator backed by a bitmap.
 ///
 /// Bit semantics: 1 = free/available, 0 = used/reserved.
 /// `new()` starts with every frame marked used.
 /// Frame indices are 0..FRAMES.
-pub struct BitmapFrameAllocator<const FRAMES: usize> {
+pub struct BitmapFrameAllocator<const FRAMES: usize>
+where
+    [(); (FRAMES + 63) / 64]:,
+{
     /// Bit words; high bits in the final word (beyond FRAMES) are always kept 0.
     words: [u64; (FRAMES + 63) / 64],
 }
 
-impl<const FRAMES: usize> BitmapFrameAllocator<FRAMES> {
+impl<const FRAMES: usize> BitmapFrameAllocator<FRAMES>
+where
+    [(); (FRAMES + 63) / 64]:,
+{
     /// Construct with all frames initially USED (reserved). Caller must call
     /// `mark_free` for each actually-available frame from the memory map.
     pub const fn new() -> Self {
