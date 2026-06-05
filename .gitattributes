@@ -1,0 +1,11 @@
+# Cairn is developed in WSL2 Ubuntu and boots on Linux/bare metal.
+# Force LF everywhere so shell scripts and source never get CRLF (which breaks
+# `#!/usr/bin/env bash` and confuses cross-platform builds).
+* text=auto eol=lf
+*.sh   text eol=lf
+*.rs   text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.ld   text eol=lf
+*.conf text eol=lf
+*.md   text eol=lf
