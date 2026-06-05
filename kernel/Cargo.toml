@@ -13,6 +13,8 @@ path = "src/main.rs"
 limine = "0.3"
 cap-core = { path = "../crates/cap-core" }
 spin = "0.9"
+x86_64 = "0.15"
+linked_list_allocator = "0.10"
 
 [profile.release]
 panic = "abort"

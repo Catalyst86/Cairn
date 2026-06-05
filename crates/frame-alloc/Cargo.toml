@@ -1,0 +1,15 @@
+[package]
+name = "frame-alloc"
+version = "0.1.0"
+edition = "2021"
+description = "Verified physical frame allocator (no_std, Kani-provable bitmap)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[features]
+kani = []
+
+[dependencies]
+
+[lib]
+path = "src/lib.rs"

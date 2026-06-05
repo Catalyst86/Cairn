@@ -1,18 +1,27 @@
 //! Keystone v0 — the Cairn bare-metal microkernel.
 //!
-//! Boots via Limine, prints a banner over COM1 serial, then halts.
-//! This is intentionally tiny: no_std + no_main, only the absolute minimum
-//! to prove the boot + serial path and the cap-core linkage.
+//! Boots via Limine, brings up GDT + IDT (exceptions only), a physical frame
+//! allocator from the memory map, and a static kernel heap. Then runs a few
+//! self-tests (breakpoint exception + heap allocation) and halts.
+//!
+//! This is still tiny: no_std + no_main. All unsafe is documented and limited
+//! to the hardware-required operations (segment loads, IDT load, static heap
+//! hand-off, port I/O in serial, hlt).
 
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use core::arch::asm;
 
+mod gdt;
+mod interrupts;
+mod memory;
 mod serial;
 
 use limine::BaseRevision;
-use limine::request::{MemoryMapRequest, RequestsEndMarker, RequestsStartMarker};
+use limine::request::{HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker};
 
 /// Limine base revision marker (must be present).
 #[used]
@@ -23,6 +32,11 @@ static BASE_REVISION: BaseRevision = BaseRevision::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
+
+/// HHDM request so we can obtain the higher-half direct-map offset for phys<->virt.
+#[used]
+#[unsafe(link_section = ".requests")]
+static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
 /// Required by the limine 0.3 crate to delimit the request array for the bootloader.
 #[used]
@@ -41,21 +55,55 @@ unsafe extern "C" fn kmain() -> ! {
     // (the assert does that) otherwise the linker may garbage-collect them.
     assert!(BASE_REVISION.is_supported(), "Limine base revision not supported");
 
-
     // Initialize COM1 16550 for reliable output (works in QEMU -serial and on bare metal).
     serial::init();
 
     // Exact banner required by the task description.
     serial_println!("Cairn keystone v0 — the core is alive");
 
-    // Report memory map entry count (the "if easy" part of the spec).
-    if let Some(memmap) = MEMORY_MAP_REQUEST.get_response() {
+    // Report memory map entry count early (keep the exact line/behavior from v0).
+    let memmap_resp = MEMORY_MAP_REQUEST.get_response();
+    if let Some(memmap) = &memmap_resp {
         serial_println!("Memory map: {} entries detected", memmap.entries().len());
     } else {
         serial_println!("Memory map: request not answered by bootloader");
     }
 
-    // (Phase 1+) here we will bring up GDT/IDT, the cap tables from cap-core, etc.
+    // Also fetch HHDM (we need the offset for memory::init even if we don't use
+    // virtual addresses in v0).
+    let hhdm_resp = HHDM_REQUEST.get_response();
+    let hhdm_offset = hhdm_resp.map(|r| r.offset()).unwrap_or(0);
+
+    // === CPU foundations + memory (order matters) ===
+    gdt::init();
+    interrupts::init_idt();
+
+    if let Some(mm) = &memmap_resp {
+        memory::init(hhdm_offset, mm);
+    } else {
+        memory::init_hhdm(hhdm_offset);
+        serial_println!("frame allocator: 0 free 4KiB frames (no memory map from Limine)");
+    }
+
+    memory::init_heap();
+
+    // --- self-tests (as specified) ---
+
+    // Trigger a breakpoint exception and prove we recovered (IDT + handler work).
+    // SAFETY: software interrupt; IDT is loaded and #BP handler returns normally.
+    x86_64::instructions::interrupts::int3();
+    serial_println!("recovered from #BP");
+
+    // Prove the heap works (alloc + Vec).
+    {
+        use alloc::vec::Vec;
+        let v: Vec<u64> = (0..5).collect();
+        serial_println!("heap self-test: allocated Vec<u64> len={}", v.len());
+        // Drop happens automatically; proves allocator didn't explode.
+    }
+
+    // Report free frames from our map-derived allocator (after the heap init line).
+    serial_println!("free frames: {}", memory::free_frame_count());
 
     hcf();
 }
