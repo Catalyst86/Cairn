@@ -26,9 +26,12 @@ It rsyncs `kernel/`, builds, makes a Limine ISO, runs QEMU ~20s (serial → `/ro
 + stdout). Filter in PowerShell with `... | Select-String -Pattern "..."` (no `grep`). Expect (no
 panic/fault anywhere):
 - Phase 3 (early, after the heap): a `pci …` device list including `pci 00:03.0 vendor=0x1af4
-  device=0x1042 … virtio-blk`; `virtio-blk: ready (queue0 size=128)`; `virtio-blk: wrote+read LBA8
-  512B match=true (flush negotiated=true)`; `objstore: mounted superblock seq=1 …` (or
-  `objstore: formatted -> seq=1` on a fresh disk).
+  device=0x1042 … virtio-blk`; `virtio-blk: ready (queue0 size=128)`; `virtio-blk: wrote+read
+  LBA32760 512B match=true (flush negotiated=true)`; `objstore: mounted superblock seq=N …` (or
+  `objstore: formatted -> seq=1` on a fresh disk); and the INC5 extent proof `extent: put lba=L
+  len=59 hash=0x7b4ded… ; X_READ=>Ok reply_hash=0x7b4ded… ; … content-addressed match=true` then
+  `extent: READ-masked cap X_READ=>ErrRights … X_WRITE=>ErrMethod`. The store persists — each boot
+  `seq` grows and the same bytes re-`put` to a fresh `lba` with the SAME hash (CoW append).
 - Phase 2 (after the cap self-tests, post-`sti`): the crash-only self-healing loop
   (`domain 4 … terminated: #UD` → `supervisor: RESTARTED …` ×2 → `reaped`), then the endpoint
   rendezvous (`ep: domain2 E_RECV resumed … recv_cptr=3`, MOVE proof `cptr=1 => status=1`), plus
@@ -39,41 +42,37 @@ panic/fault anywhere):
   (blocking endpoint rendezvous + capability transfer + scheduler block/wake), and crash-only
   domain supervision **+ restart/self-healing**.
 - **Phase 3 (zero-kernel I/O + object store) is UNDERWAY:** INC1 PCI enum ✅, INC2 virtio-blk read
-  ✅, INC3 write ✅, INC4 Cairnlog superblock + content hash + `flush` ✅ (proven to **persist
-  across a reboot**: boot1 formats seq=1, boot2 mounts seq=1). Last feature commit: `6a29905`.
+  ✅, INC3 write ✅, INC4 Cairnlog superblock + content hash + `flush` ✅, INC5 append-log `put` +
+  content-addressed Extent caps ✅ (verified across 5 boots: seq 1→4, same content hash re-`put` to a
+  fresh lba each boot = CoW append; adversarial panel caught + fixed a mount() reformat-on-read-error
+  data-loss bug and a smoke-test/log LBA collision). Last feature commit: `a082d63`.
 
-## STEP 3 — Your task: Phase 3 INC5 — append-log `put` + content-addressed Extent caps
-Everything below is fleshed out in `docs/PHASE3.md` and `RESUME.md`; this is the concrete plan.
-In `kernel/src/objstore.rs` (it already has `MOUNTED: Superblock`, `fnv1a`, the A/B superblock
-read/write, and `mount()`):
-- `pub fn put(bytes: &[u8]) -> Option<(u64 /*lba*/, u32 /*len*/, u64 /*hash*/)>`: starting at
-  `MOUNTED.log_head_lba`, write the data sectors, THEN a record header sector
-  (`{rec_magic, kind, content_len, content_hash, prev_lba}`) — **data-before-header**, so a torn
-  tail is never advertised. `fnv1a` the content. `virtio_blk::flush()`. Then **commit**: write the
-  OTHER superblock slot (alternate LBA0/1) with `seq+1`, the new root `(lba, len, hash)`, and an
-  advanced `log_head_lba`; `flush()` again. **The superblock flip is the single commit point.**
-  Update the in-RAM `MOUNTED`.
-- Mint an **Extent cap** naming the content. In `kernel/src/capspace.rs` (mirror the existing
-  `NOTIFY`/`ENDPOINTS` pattern EXACTLY — const-static side-table, never touch cap-core):
-  - `pub const X_READ: u16 = 1; pub const X_WRITE: u16 = 2; pub const X_COMMIT: u16 = 3;`
-  - `static mut EXTENTS: [ExtentMeta; OBJECT_TABLE_SIZE]` where
-    `ExtentMeta { lba: u64, len: u32, hash: u64 }`, const-initialized (NOT by-value-on-stack — the
-    boot-stack-overflow bug class).
-  - `pub fn mint_extent(lba, len, hash) -> Option<u16>`: `create_object(ObjectKind::Extent)` +
-    `EXTENTS[oid] = meta` + mint a root cap with `READ|WRITE|MAP|DELEGATE` (mirror
-    `create_endpoint`/`create_notification`).
-  - Wire dispatch: in `dispatch_method`'s `extra`-rights match add `(Extent, X_READ) => READ` and
-    `(Extent, X_WRITE | X_COMMIT) => WRITE`; add `(Extent, X_READ)` arm returning the **metadata**
-    `{lba, len, hash}` (X_READ returns metadata ONLY — bytes reach a domain via Extent **MAP**,
-    which ships with INC7, per CAP_ABI §5 "core not in the bulk data path"). `X_WRITE`/`X_COMMIT`
-    drive `objstore::put`/commit.
-- **Proof (boot-log):** `objstore::put` some bytes (kernel self-test), `cap_invoke(extent, X_READ)`
-  returns the metadata, then re-read the on-disk bytes and confirm `fnv1a == hash`. Print it.
+## STEP 3 — Your task: Phase 3 INC6 — objects survive reboot (T2 milestone)
+INC5 (commit `a082d63`) landed `objstore::put` (append-log + A/B superblock flip commit) and
+content-addressed Extent caps (`mint_extent`, `extent_metadata`, `X_READ`/`X_WRITE`/`X_COMMIT`,
+`EXTENTS` side-table). The store already PERSISTS: each boot's committed `put` becomes the next
+boot's mounted superblock root (`{root_lba, root_len, root_hash}`). INC6 closes the loop: prove a
+committed object is **recoverable as a live Extent cap after a reboot, without re-putting it**.
+- In `kernel/src/objstore.rs`: add `pub fn recover() -> Option<(u64, u32, u64)>` (or fold into
+  `mount`) that, when `MOUNTED_OK && MOUNTED.root_len > 0`, returns the committed root
+  `{root_lba, root_len, root_hash}`; re-hash the on-disk bytes with `extent_content_hash(root_lba,
+  root_len)` and confirm it equals `root_hash` (a Merkle-style integrity check on the persisted root).
+- In `kernel/src/main.rs` (a boot self-test, root domain, pre-`sti`): after `mount`, call `recover`;
+  if a root exists, `capspace::mint_extent(root_lba, root_len, root_hash)` to RE-MINT the root Extent
+  cap from on-disk state, `cap_invoke(root_ext, X_READ)` to confirm it returns `root_hash`, and print
+  `objstore: recovered root Extent cptr=.. lba=.. len=.. hash=.. reverify=true`. (No cap-core change —
+  `mint_extent`/`extent_metadata` already exist. CPtrs are ephemeral, re-minted each boot from the
+  durable content hash; sealed persisted tokens are CAP_ABI §7, deferred.)
+- **Proof (2 runs on the persisted `/root/cairn-disk.img`):** run1 `put`s+commits → prints
+  `content-addressed match=true` with hash H at some lba. run2 `mount`+`recover` re-mints the root
+  Extent **from run1's committed superblock** (root_lba = run1's data lba) and prints the SAME hash H
+  with `reverify=true` — WITHOUT a new put having produced it. (The boot self-test still does its own
+  fresh `put`; INC6's new line specifically proves the PRIOR boot's root survived.) Watch for the
+  ordering: `recover` reads the root committed by the PREVIOUS boot (this boot's `put` runs after).
 
-Then **INC6** (objects survive reboot — on `mount`, re-mint the root Extent from the committed
-superblock; `/root/cairn-disk.img` persists across runs; prove with a 2-run or boot-count marker)
-and **INC7** (zero-kernel DeviceQueue grant + Extent MAP — the namesake pillar-4 milestone, bumps
-`MAX_DOMAINS` 5→6).
+Then **INC7** (zero-kernel DeviceQueue grant + Extent MAP — the namesake pillar-4 milestone: first
+live use of `Rights::MAP`, maps ring+doorbell into a trusted driver domain, bumps `MAX_DOMAINS` 5→6;
+`extent_metadata` is the seed for Extent MAP). Full plan in `docs/PHASE3.md` INC6/INC7.
 
 ## Hard rules — do not violate
 - **cap-core (`crates/cap-core`) is FROZEN and Kani-verified — NEVER edit it.**
@@ -105,7 +104,7 @@ and **INC7** (zero-kernel DeviceQueue grant + Extent MAP — the namesake pillar
 ## Working method (this project's proven rhythm)
 - **Increment → verify in QEMU → adversarially review (for subtle code) → fix → commit → update
   docs.** Don't claim done without a boot-log proof.
-- For **subtle/novel** pieces (INC5's crash-consistent commit, INC7's DMA mapping/Extent MAP), use a
+- For **subtle/novel** pieces (INC7's DMA mapping/Extent MAP, future crash-consistency work), use a
   **judged design panel** then an **adversarial review panel** via the Workflow tool (find → verify
   with 3 skeptics per finding; majority confirms). The Phase 2/3 panels caught real bugs (a
   GS-neutrality unsoundness in the block/wake switch, a cap-transfer error-swallow, a virtio
@@ -131,5 +130,5 @@ management plane + TCB verification. Thesis: *everything is a capability over on
 substrate, and the kernel gets out of the data path.* Phase 3 makes that real (Extent caps over a
 log-structured store; DeviceQueue caps for kernel-free I/O at INC7).
 
-Start by reading `RESUME.md`, confirming the clean boot, then implementing INC5. Ask me nothing you
+Start by reading `RESUME.md`, confirming the clean boot, then implementing INC6. Ask me nothing you
 can answer from the repo — but do confirm direction before any large multi-agent workflow run.

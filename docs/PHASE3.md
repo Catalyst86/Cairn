@@ -57,9 +57,15 @@ sectors THEN the record header (data-before-header so a torn tail is never adver
 not durability under QEMU writeback) → write the OTHER superblock slot `seq+1` + new root +
 `sb_hash` → FLUSH again. **The superblock flip is the single linearization point.** **Recovery:**
 read A+B, validate `sb_hash`, pick the higher VALID seq; a torn superblock fails its hash → fall
-back to the previous-good root (lose only the uncommitted batch). The durable name is the on-disk
-`content_hash`; at boot `recover()` re-mints Extent caps from the committed root (CPtrs are
-ephemeral — sealed sparse 128-bit persisted tokens are CAP_ABI §7, deferred).
+back to the previous-good root (lose only the uncommitted batch). **Read-error vs. invalid (INC5
+review fix):** `read_superblock` returns `Io | Invalid | Valid` — a device-level read FAILURE is
+NOT the same as a slot that read OK but is fresh/torn. `mount` formats (writing slot A) ONLY when
+BOTH slots read OK and are `Invalid`; if EITHER read returned `Io`, that slot may still hold the
+latest committed superblock, so `mount` REFUSES to format (leaving the store unmounted) rather than
+clobbering it. (Collapsing both to a single `None`, as the original code did, let one transient read
+glitch on the sole good slot trigger a reformat that destroyed all committed data.) The durable name
+is the on-disk `content_hash`; at boot `recover()` re-mints Extent caps from the committed root (INC6;
+CPtrs are ephemeral — sealed sparse 128-bit persisted tokens are CAP_ABI §7, deferred).
 
 ## Increment roadmap
 - **INC1 — PCI enumeration ✅ DONE** (`pci.rs`, commit pending): legacy `0xCF8/0xCFC` scan of
@@ -83,7 +89,22 @@ ephemeral — sealed sparse 128-bit persisted tokens are CAP_ABI §7, deferred).
   `virtio_blk.rs`): FNV-1a hash, A/B superblock @ LBA0/1 (content-hash validated, higher-valid-seq
   wins), format-on-first-boot, `flush()` (negotiated `VIRTIO_BLK_F_FLUSH`). Verified across 2 boots:
   formats seq=1 then mounts seq=1 (superblock persists). LBA0/1 now store-owned (INC2 magic gone).
-- **INC5 — append-log store v0 + Extent caps** (`objstore::put`; `X_READ`/`X_WRITE`/`X_COMMIT` arms).
+- **INC5 — append-log store v0 + Extent caps ✅ DONE** (commit `a082d63`; `objstore.rs`,
+  `capspace.rs`, `main.rs`, `virtio_blk.rs`). `objstore::put(bytes)` → data sectors → record header
+  (data-before-header) → `flush` → flip the OTHER A/B superblock slot (`seq+1`, new root, advanced
+  `log_head`) → `flush`; the flip is the single commit point. `extent_content_hash` re-reads + re-hashes
+  on-disk bytes. Extent caps (`ObjectKind::Extent=8`, cap-core UNCHANGED): `X_READ`/`X_WRITE`/`X_COMMIT`
+  ids + `EXTENTS` const-static side-table (mirror `NOTIFY`/`ENDPOINTS`) + `mint_extent`
+  (INVOKE|READ|WRITE|MAP|DELEGATE) + `extent_metadata` (verified INVOKE|READ → `{lba,len,hash}`, the
+  INC7 MAP seed); `dispatch_method` gates `X_READ`→READ (returns the content hash) and
+  `X_WRITE`/`X_COMMIT`→WRITE (then `ErrMethod` — the bulk write path arrives with Extent MAP in INC7).
+  Verified across 5 boots: fresh format seq=1, put lba=2 hash=H content-addressed match=true; persisted
+  mounts seq 2→4 (log_head→8) re-put the SAME hash at a fresh lba (CoW append); READ-masked cap
+  X_READ⇒ErrRights, X_WRITE⇒ErrMethod. **Adversarial-panel review** (find → 3-skeptic refute; 2 of 5
+  confirmed): HIGH — `mount()` conflated a device read error with an invalid slot and could reformat
+  over the only good superblock; `read_superblock` now returns `Io|Invalid|Valid`, and `mount` formats
+  only when both slots read OK and are fresh/torn (else refuses, leaving the store unmounted). MED — the
+  L2 `smoke_test` scratch write moved LBA 8 → 32760 (the growing log reaches LBA 8 by ~boot 4).
 - **INC6 — OBJECTS SURVIVE REBOOT (T2 milestone):** run1 puts+commits, prints hashes; QEMU exits
   (`/root/cairn-disk.img` persists); run2 `recover()` re-mints the root Extent, re-hashes, prints
   the SAME hashes. Two-run wrapper or on-disk boot-count marker.
