@@ -23,8 +23,23 @@ mod paging;
 mod capspace;
 mod serial;
 
-use limine::request::{HhdmRequest, MemmapRequest};
+use limine::request::{HhdmRequest, MemmapRequest, StackSizeRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
+
+/// Request a generously-sized boot stack from Limine.
+///
+/// Limine's default boot stack (~64 KiB) is placed immediately above its own
+/// page tables. A single deep call chain overflows it straight into those page
+/// tables and zeroes them: in debug builds the by-value construction of the 8 KiB
+/// `ObjectTable` (capspace `OBJECTS`) cascades several full-struct memcpys, ~90 KiB
+/// of stack, which clobbered Limine's L1/L2/L3/L4 — the "map-then-unmap" page fault.
+/// 1 MiB gives >10x head-room so the kernel stack can never reach the page tables.
+/// (Confirmed via a GDB hardware watchpoint on the L1 PTE: a `compiler_builtins`
+/// memcpy with dest inside the page-table region, RSP already below all four tables.)
+const KERNEL_STACK_SIZE: u64 = 1024 * 1024; // 1 MiB
+#[used]
+#[unsafe(link_section = ".requests")]
+static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(KERNEL_STACK_SIZE);
 
 /// Limine base revision marker (must be present).
 #[used]
@@ -85,6 +100,16 @@ unsafe extern "C" fn kmain() -> ! {
     let hhdm_offset = hhdm_resp.map(|r| r.offset).unwrap_or(0);
     serial_println!("HHDM offset: {:#x}", hhdm_offset);
 
+    // Confirm Limine gave us the large boot stack we asked for. Presence of the
+    // response == compliance. If this is ever "NOT honored" we are still on the
+    // tiny default stack and a deep call will corrupt the page tables (see the
+    // STACK_SIZE_REQUEST doc comment).
+    if STACK_SIZE_REQUEST.response().is_some() {
+        serial_println!("Boot stack: {} KiB (Limine request honored)", KERNEL_STACK_SIZE / 1024);
+    } else {
+        serial_println!("Boot stack: WARNING request NOT honored — on default stack!");
+    }
+
     // === CPU foundations + memory (order matters) ===
     gdt::init();
     interrupts::init_idt();
@@ -95,10 +120,6 @@ unsafe extern "C" fn kmain() -> ! {
         memory::init_hhdm(hhdm_offset);
         serial_println!("frame allocator: 0 free 4KiB frames (no memory map from Limine)");
     }
-
-    // Pre-map the kernel's NOBITS .bss now, in normal context (Limine leaves the
-    // first bss page unmapped; the #PF handler can't read the tables reliably).
-    paging::premap_bss(hhdm_offset);
 
     memory::init_heap();
 
@@ -120,26 +141,22 @@ unsafe extern "C" fn kmain() -> ! {
     // Report free frames from our map-derived allocator (after the heap init line).
     serial_println!("free frames: {}", memory::free_frame_count());
 
-    // --- capability self-test (wires verified cap-core into the live kernel) ---
-    // TEMPORARILY DISABLED. capspace's large static cap tables land in the part of
-    // the kernel .bss that Limine leaves unmapped, and our on-demand pager can't
-    // yet create page tables in HHDM-uncovered frames. The next focused task is
-    // proper kernel page-table setup (build our own tables instead of patching
-    // Limine's). capspace.rs + paging.rs are written, reviewed, and compile.
-    // --- capability self-test: DISABLED pending the paging rework. ---
-    // Root cause isolated: writing capspace's large .bss statics faults because
-    // Limine leaves the first bss page unmapped, and our on-demand mapper can't
-    // recover — reading the active L4 through the HHDM *inside the #PF handler*
-    // returns 0 even though the CPU is executing from that L4 entry (interrupt-
-    // context vs normal-context inconsistency). The fix is for keystone to build
-    // and load its OWN page tables instead of patching Limine's. See NOTES below.
-    // --- capability self-test: DISABLED pending the page-table rework. ---
-    // premap_bss maps the whole .bss successfully in normal context (all_ok),
-    // but pages are then silently un-mapped before capspace runs (a frame the
-    // allocator hands out is a live page table; a write corrupts it). Needs QEMU
-    // live page-table inspection. capspace.rs + paging.rs compile and are ready.
-    serial_println!("capspace + paging loaded (live cap_invoke demo pending page-table rework)");
-    let _ = (capspace::M_ALLOC, capspace::M_FREE);
+    // --- capability self-test: live cap_invoke demo (verified cap-core wired in) ---
+    // Creates a Memory object, mints a fully-powered cap, invokes ALLOC twice
+    // (distinct frames), then revokes (epoch bump) and proves the stale cap now
+    // fails with ErrRevoked — the verified I2 invariant, live.
+    match capspace::init_root() {
+        Some(cptr) => {
+            serial_println!("init_root => cptr={}", cptr);
+            let (s1, f1) = capspace::cap_invoke(cptr, capspace::M_ALLOC, 0);
+            serial_println!("cap_invoke(ALLOC,0) => {:?} frame={:#x}", s1, f1 * 4096);
+            let (s2, f2) = capspace::cap_invoke(cptr, capspace::M_ALLOC, 0);
+            serial_println!("cap_invoke(ALLOC,0) => {:?} frame={:#x}", s2, f2 * 4096);
+            let rs = capspace::demo_revoke_then_invoke(cptr);
+            serial_println!("demo_revoke_then_invoke => {:?}", rs);
+        }
+        None => serial_println!("init_root failed"),
+    }
 
     hcf();
 }

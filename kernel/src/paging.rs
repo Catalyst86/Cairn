@@ -1,11 +1,22 @@
-//! Minimal kernel paging: on-demand mapping of the kernel's higher-half pages.
+//! Minimal kernel paging helpers over Limine's page tables.
 //!
-//! Limine maps the kernel ELF, but on this setup it leaves the first part of the
-//! NOBITS `.bss` tail unmapped — writing a static there faults (page-not-present).
-//! Rather than guess the range up front, we map the exact faulting page on demand
-//! from the `#PF` handler, using the active (Limine) page tables reached through
-//! the HHDM plus our physical frame allocator. This is the kernel taking
-//! ownership of its own virtual memory, one page at a time.
+//! Limine maps the entire kernel ELF — including the NOBITS `.bss` tail — and a
+//! higher-half direct map (HHDM). We confirmed this empirically (a normal-context
+//! page-table walk shows every `.bss` page present before we touch it), so the
+//! kernel does not need to pre-map `.bss`.
+//!
+//! What remains here:
+//! - `dump_walk`: a normal-context page-table walker for diagnostics.
+//! - `manual_map`: install a single L1 entry into the active hierarchy. Retained
+//!   as a defensive backstop in the `#PF` handler (maps a kernel higher-half page
+//!   on demand should one ever be missing), and as a building block for the
+//!   demand-paged heap in a later phase.
+//! - `map_one_page`: the same idea via the `x86_64` `Mapper`, kept for later use.
+//!
+//! NOTE: a previous, incorrect theory held that Limine left part of `.bss`
+//! unmapped and that on-demand mapping was load-bearing. The real defect was a
+//! kernel-stack overflow into Limine's page tables (fixed by requesting a 1 MiB
+//! boot stack in `main.rs`); see that commit / `RESUME.md` for the full trace.
 
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
@@ -109,28 +120,6 @@ pub fn manual_map(hhdm: u64, va: u64) -> bool {
         core::ptr::write_bytes(va as *mut u8, 0, 4096);
     }
     true
-}
-
-/// Pre-map the entire kernel `.bss` from NORMAL (non-interrupt) context, where
-/// HHDM page-table reads are reliable — unlike the `#PF` handler, where reading
-/// the active L4 through the HHDM returned 0. Must run after the frame allocator
-/// is up and before any large bss static is first written.
-pub fn premap_bss(hhdm: u64) {
-    extern "C" {
-        static __bss_start: u8;
-        static __bss_end: u8;
-    }
-    let start = unsafe { core::ptr::addr_of!(__bss_start) as u64 };
-    let end = unsafe { core::ptr::addr_of!(__bss_end) as u64 };
-    let mut addr = start & !0xfff;
-    let mut ok = true;
-    while addr < end {
-        if !manual_map(hhdm, addr) {
-            ok = false;
-        }
-        addr += 0x1000;
-    }
-    crate::serial_println!("premap_bss [{:#x}..{:#x}) all_ok={}", start, end, ok);
 }
 
 /// Ensure the 4 KiB page containing `addr` is mapped present+writable. If it is
