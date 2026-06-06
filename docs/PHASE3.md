@@ -105,9 +105,18 @@ CPtrs are ephemeral — sealed sparse 128-bit persisted tokens are CAP_ABI §7, 
   over the only good superblock; `read_superblock` now returns `Io|Invalid|Valid`, and `mount` formats
   only when both slots read OK and are fresh/torn (else refuses, leaving the store unmounted). MED — the
   L2 `smoke_test` scratch write moved LBA 8 → 32760 (the growing log reaches LBA 8 by ~boot 4).
-- **INC6 — OBJECTS SURVIVE REBOOT (T2 milestone):** run1 puts+commits, prints hashes; QEMU exits
-  (`/root/cairn-disk.img` persists); run2 `recover()` re-mints the root Extent, re-hashes, prints
-  the SAME hashes. Two-run wrapper or on-disk boot-count marker.
+- **INC6 — OBJECTS SURVIVE REBOOT (T2 milestone) ✅ DONE** (commit `8e66c0f`; `objstore.rs`,
+  `main.rs`). `objstore::recover()` re-derives the committed root from the mounted superblock
+  (`{root_lba,root_len,root_hash}`, gated on `root_len>0`) and re-verifies it — re-reads + re-hashes
+  the on-disk bytes (`extent_content_hash`) and confirms they still match `root_hash`; a torn root or a
+  superblock pointing at corrupt bytes returns `None` (never advertised). Called right after `mount`,
+  BEFORE this boot's `put`, so it reflects the PREVIOUS boot's committed root. The boot self-test
+  re-mints a live Extent cap from the recovered root (`capspace::mint_extent` — CPtrs are ephemeral,
+  re-derived each boot from the durable content hash) and `cap_invoke(X_READ)` confirms the same hash.
+  **Verified 2-run on the persisted `/root/cairn-disk.img`:** run1 (fresh) prints `no committed root to
+  recover (fresh store)` and commits hash H; run2 prints `recovered root Extent cptr=0 lba=2 len=59
+  hash=H (on-disk re-hash matched); X_READ=>Ok …; objects-survive-reboot=true` — run1's object recovered
+  as a live cap from disk alone, no new put. (Persisted sealed cap tokens are CAP_ABI §7, deferred.)
 - **INC7 — DeviceQueue cap + zero-kernel data path (T1 milestone, the namesake):**
   `map_user_mmio_page` (USER+NO_CACHE doorbell) + a map-existing-phys-frame-at-user-VA helper
   (`map_user_page` allocates a fresh frame, can't map the ring frames); `create_device_queue` +

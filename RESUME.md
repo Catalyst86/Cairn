@@ -19,18 +19,22 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    -> seq=1` on a fresh `/root/cairn-disk.img`); and the **INC5 extent proof** `extent: put lba=L
    len=59 hash=0x7b4ded… ; X_READ=>Ok reply_hash=0x7b4ded… ; meta=Some((L,59,…)); on-disk
    re-read=Some(…); content-addressed match=true` then `extent: READ-masked cap X_READ=>ErrRights …
-   X_WRITE=>ErrMethod`. The store PERSISTS: each boot `seq` grows (1→2→3…), `log_head` advances, and
-   the same bytes re-`put` to a fresh `lba` with the SAME hash (CoW append). (`rm
+   X_WRITE=>ErrMethod`; and the **INC6 recovery proof** `objstore: recovered root Extent cptr=0 lba=L
+   len=59 hash=0x7b4ded… (on-disk re-hash matched); X_READ=>Ok …; objects-survive-reboot=true` (or
+   `no committed root to recover (fresh store)` on the very first boot after `rm`). The store PERSISTS:
+   each boot `seq` grows (1→2→3…), `log_head` advances, the same bytes re-`put` to a fresh `lba` with
+   the SAME hash (CoW append), and `recover()` re-mints the PRIOR boot's committed root from disk. (`rm
    /root/cairn-disk.img` to reset the store.) Note the old INC2 "read LBA0 magic" line is GONE —
-   LBA0/1 now hold the superblock.
+   LBA0/1 now hold the superblock. (The `perdomain:` line's "root CPtr N" integer varies — recover/INC5
+   mint Extent caps first — but always `=> ErrBadCPtr (isolated)`; the value is incidental.)
 2. **Phase 3 is UNDERWAY** (zero-kernel I/O + object store; architected in `docs/PHASE3.md`).
    **INC1 (PCI enum) ✅ · INC2 (virtio-blk read) ✅ · INC3 (write) ✅ · INC4 (Cairnlog superblock +
-   content hash + flush) ✅ · INC5 (append-log `put` + content-addressed Extent caps) ✅.** The L2
-   block layer (`virtio_blk::read_sector`/`write_sector`/`flush`, one shared `submit()`), the L3
-   superblock (`objstore.rs`: FNV-1a hash, A/B superblock at LBA0/1, format/mount, durable via
-   flush), and the **L4 append-log + Extent caps** all work; the store PERSISTS across QEMU restarts
-   (verified across 5 boots: seq 1→4, log_head 2→8, same content hash re-`put` to a fresh lba each
-   boot = CoW append).
+   content hash + flush) ✅ · INC5 (append-log `put` + content-addressed Extent caps) ✅ · INC6
+   (objects survive reboot — T2 milestone) ✅.** The L2 block layer
+   (`virtio_blk::read_sector`/`write_sector`/`flush`, one shared `submit()`), the L3 superblock
+   (`objstore.rs`: FNV-1a hash, A/B superblock at LBA0/1, format/mount, durable via flush), the **L4
+   append-log + Extent caps**, and **reboot recovery** all work; the store PERSISTS across QEMU restarts
+   (verified: a committed object is re-minted as a live Extent cap on the next boot from disk alone).
    **INC5 (done, commit `a082d63`):** `objstore::put(bytes)` writes data sectors → a record header
    (data-before-header) → `flush` → flips the OTHER A/B superblock slot (`seq+1`, new root, advanced
    `log_head`) → `flush` (the flip = the single commit). `extent_content_hash` re-reads on-disk bytes
@@ -42,13 +46,21 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    level (`read_superblock` now returns `Io|Invalid|Valid`; format only when both slots read OK and
    are fresh/torn); (MED) the L2 smoke scratch write moved LBA 8 → 32760 so it never collides with the
    growing log.
-   **NEXT = INC6: objects survive reboot (T2 milestone).** On `mount`, re-mint the root Extent cap
-   from the committed superblock's `{root_lba, root_len, root_hash}` (when `root_len>0`) via
-   `capspace::mint_extent`, re-hash the on-disk bytes (`objstore::extent_content_hash`), and prove the
-   SAME content hash survives a reboot — the disk already persists the root (this boot's `put` becomes
-   next boot's mounted root). Then **INC7** (zero-kernel DeviceQueue grant + Extent MAP — first live
-   use of `Rights::MAP`; bumps `MAX_DOMAINS` 5→6). Full plan + DMA trust boundary + crash-consistency
-   in `docs/PHASE3.md`. cap-core byte-unchanged (Extent=8/DeviceQueue=9 already exist).
+   **INC6 (done, commit `8e66c0f`):** `objstore::recover()` re-derives the committed root from the
+   mounted superblock (`{root_lba,root_len,root_hash}`, gated on `root_len>0`) and re-verifies it
+   (re-reads + re-hashes the on-disk bytes; mismatch ⇒ `None`, never advertises a corrupt root). The
+   boot self-test re-mints a live Extent cap from it (`mint_extent`) and `cap_invoke(X_READ)` confirms
+   the same hash. Verified 2-run: run1 fresh ⇒ "no committed root"; run2 recovers run1's object
+   `objects-survive-reboot=true` WITHOUT a new put. (CPtrs are ephemeral, re-derived each boot from the
+   durable content hash; sealed persisted tokens are CAP_ABI §7, deferred.)
+   **NEXT = INC7: zero-kernel DeviceQueue grant + Extent MAP (T1 milestone, the namesake).** First
+   live use of `Rights::MAP`: a `DeviceQueue` cap (`ObjectKind::DeviceQueue=9`) whose `DQ_MAP` maps the
+   virtqueue rings + a USER no-cache doorbell page into a TRUSTED driver domain (bump `MAX_DOMAINS`
+   5→6), so a ring-3 driver blob fills a descriptor + rings the doorbell + polls used with ZERO
+   syscalls; plus Extent `MAP` (map the named data sectors into a domain — `extent_metadata` is the
+   seed). Mirror the side-table pattern (`DEVQUEUES`), add `map_user_mmio_page` + a map-existing-phys
+   helper, negative test MAP-masked ⇒ ErrRights. Full plan + the no-IOMMU DMA trust boundary in
+   `docs/PHASE3.md` INC7. cap-core byte-unchanged (Extent=8/DeviceQueue=9 already exist).
    - **Or small Phase-2 polish** (`docs/CRASH_ONLY.md`/`PORTAL_IPC.md` "deferred"):
      survivor-liveness scrub, per-domain frame reclamation on death, blocking `N_WAIT`.
 3. **cap-core stays byte-unchanged** (the regression gate; `git diff HEAD -- crates/` must be
@@ -56,7 +68,7 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    `cbmc` running — kill any `cbmc`/`cargo-kani`/`kani-driver` by NAME first: `pkill -9 cbmc`,
    NOT `-f` which self-matches the kill command). cap-core's 4 proofs already pass; to re-confirm
    run ONLY `cargo kani -p cap-core --features kani`. At handoff the last FEATURE commit is
-   Phase 3 INC5 (append-log put + Extent caps) `a082d63` (HEAD is the RESUME-update commit after it;
+   Phase 3 INC6 (objects survive reboot) `8e66c0f` (HEAD is the RESUME-update commit after it;
    run `git log --oneline -20`).
 
 ## Status (Phase 3: zero-kernel I/O + object store — UNDERWAY) 🚧
@@ -98,11 +110,22 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
   `Io|Invalid|Valid` and `mount` refuses to format unless BOTH slots read OK and are fresh/torn. MED —
   `smoke_test` scrubbed LBA 8 (the growing log reaches it ~boot 4); moved to LBA 32760. cap-core
   byte-unchanged.
-- 🚧 **NEXT = INC6 objects-survive-reboot (T2)** — on `mount`, re-mint the root Extent from the
-  committed superblock's `{root_lba,root_len,root_hash}` (`root_len>0`) and re-verify the content hash
-  across a reboot → then INC7 zero-kernel DeviceQueue grant + Extent MAP (first live `Rights::MAP`,
-  `MAX_DOMAINS` 5→6). Architecture, cap-mapping (Extent=8/DeviceQueue=9, cap-core unchanged), DMA
-  trust boundary, crash-consistency: `docs/PHASE3.md`.
+- ✅ **INC6 — objects survive reboot (T2 milestone)** (commit `8e66c0f`; `objstore.rs`, `main.rs`).
+  `objstore::recover()` re-derives the committed root from the mounted superblock (gated `root_len>0`)
+  and re-verifies it (re-reads + re-hashes the on-disk bytes; mismatch ⇒ `None`, never advertises a
+  corrupt root). The boot self-test re-mints a live Extent cap from it (`mint_extent`) and
+  `cap_invoke(X_READ)` confirms the same content hash. **Verified 2-run on the persisted disk:** run1
+  fresh ⇒ `no committed root to recover (fresh store)`; run2 `recovered root Extent cptr=0 lba=2 …
+  objects-survive-reboot=true` — run1's committed object re-minted as a live cap from disk alone, no
+  new put. CPtrs are ephemeral (re-derived each boot from the durable hash); sealed persisted tokens
+  are CAP_ABI §7, deferred. cap-core byte-unchanged; no new warnings.
+- 🚧 **NEXT = INC7 zero-kernel DeviceQueue grant + Extent MAP (T1 milestone, the namesake)** — first
+  live `Rights::MAP`: a `DeviceQueue` cap (`ObjectKind::DeviceQueue=9`) whose `DQ_MAP` maps the
+  virtqueue rings + a USER no-cache doorbell into a TRUSTED driver domain (bump `MAX_DOMAINS` 5→6) so a
+  ring-3 driver does I/O with ZERO syscalls; plus Extent `MAP` (map the named sectors —
+  `extent_metadata` is the seed). Mirror the side-table pattern (`DEVQUEUES`), add `map_user_mmio_page`
+  + a map-existing-phys helper, negative test MAP-masked ⇒ ErrRights. Architecture, cap-mapping
+  (Extent=8/DeviceQueue=9, cap-core unchanged), the no-IOMMU DMA trust boundary: `docs/PHASE3.md`.
 
 ## Status (Phase 2: crash-only domain supervision + restart) ✅
 - ✅ **Restart / self-healing** (commit `a1b37bf`; `supervisor.rs`): `terminate_current` calls
@@ -348,8 +371,8 @@ crash-only domain supervision (ring-3 fault terminates the domain, not the kerne
 crash-only restart / self-healing (supervisor re-admits under a budget) ✅ (Phase 2 COMPLETE) →
 **Phase 3 — zero-kernel I/O + object store: PCI enum ✅ (INC1) → polled virtio-blk driver ✅
 (INC2) → write round-trip ✅ (INC3) → Cairnlog superblock+hash+flush ✅ (INC4) → append-log
-put + content-addressed Extent caps ✅ (INC5) → objects-survive-reboot (INC6, NEXT) → DeviceQueue
-zero-kernel grant + Extent MAP (INC7); see docs/PHASE3.md** →
+put + content-addressed Extent caps ✅ (INC5) → objects-survive-reboot ✅ (INC6) → DeviceQueue
+zero-kernel grant + Extent MAP (INC7, NEXT); see docs/PHASE3.md** →
 Ring-3 follow-ups (deferred, see commits): fair co-scheduling (the demo now co-schedules
 faulter+client+server across domains and works, but equal EDF deadlines are still broken by
 lowest-index — no round-robin among equal deadlines), return a Memory CPtr (not a raw frame) to

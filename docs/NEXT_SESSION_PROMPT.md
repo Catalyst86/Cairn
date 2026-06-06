@@ -28,10 +28,13 @@ panic/fault anywhere):
 - Phase 3 (early, after the heap): a `pci …` device list including `pci 00:03.0 vendor=0x1af4
   device=0x1042 … virtio-blk`; `virtio-blk: ready (queue0 size=128)`; `virtio-blk: wrote+read
   LBA32760 512B match=true (flush negotiated=true)`; `objstore: mounted superblock seq=N …` (or
-  `objstore: formatted -> seq=1` on a fresh disk); and the INC5 extent proof `extent: put lba=L
-  len=59 hash=0x7b4ded… ; X_READ=>Ok reply_hash=0x7b4ded… ; … content-addressed match=true` then
-  `extent: READ-masked cap X_READ=>ErrRights … X_WRITE=>ErrMethod`. The store persists — each boot
-  `seq` grows and the same bytes re-`put` to a fresh `lba` with the SAME hash (CoW append).
+  `objstore: formatted -> seq=1` on a fresh disk); the INC5 extent proof `extent: put lba=L len=59
+  hash=0x7b4ded… ; X_READ=>Ok reply_hash=0x7b4ded… ; … content-addressed match=true` then `extent:
+  READ-masked cap X_READ=>ErrRights … X_WRITE=>ErrMethod`; and the INC6 recovery proof `objstore:
+  recovered root Extent cptr=0 lba=L … objects-survive-reboot=true` (or `no committed root to recover
+  (fresh store)` on the first boot after `rm`). The store persists — each boot `seq` grows, the same
+  bytes re-`put` to a fresh `lba` with the SAME hash (CoW), and `recover()` re-mints the prior boot's
+  committed root from disk.
 - Phase 2 (after the cap self-tests, post-`sti`): the crash-only self-healing loop
   (`domain 4 … terminated: #UD` → `supervisor: RESTARTED …` ×2 → `reaped`), then the endpoint
   rendezvous (`ep: domain2 E_RECV resumed … recv_cptr=3`, MOVE proof `cptr=1 => status=1`), plus
@@ -43,36 +46,37 @@ panic/fault anywhere):
   domain supervision **+ restart/self-healing**.
 - **Phase 3 (zero-kernel I/O + object store) is UNDERWAY:** INC1 PCI enum ✅, INC2 virtio-blk read
   ✅, INC3 write ✅, INC4 Cairnlog superblock + content hash + `flush` ✅, INC5 append-log `put` +
-  content-addressed Extent caps ✅ (verified across 5 boots: seq 1→4, same content hash re-`put` to a
-  fresh lba each boot = CoW append; adversarial panel caught + fixed a mount() reformat-on-read-error
-  data-loss bug and a smoke-test/log LBA collision). Last feature commit: `a082d63`.
+  content-addressed Extent caps ✅ (adversarial panel caught + fixed a mount() reformat-on-read-error
+  data-loss bug and a smoke-test/log LBA collision), INC6 objects-survive-reboot ✅ (T2 milestone:
+  `objstore::recover()` re-mints the prior boot's committed root as a live Extent cap from disk, hash
+  re-verified — proven 2-run). Last feature commit: `8e66c0f`.
 
-## STEP 3 — Your task: Phase 3 INC6 — objects survive reboot (T2 milestone)
-INC5 (commit `a082d63`) landed `objstore::put` (append-log + A/B superblock flip commit) and
-content-addressed Extent caps (`mint_extent`, `extent_metadata`, `X_READ`/`X_WRITE`/`X_COMMIT`,
-`EXTENTS` side-table). The store already PERSISTS: each boot's committed `put` becomes the next
-boot's mounted superblock root (`{root_lba, root_len, root_hash}`). INC6 closes the loop: prove a
-committed object is **recoverable as a live Extent cap after a reboot, without re-putting it**.
-- In `kernel/src/objstore.rs`: add `pub fn recover() -> Option<(u64, u32, u64)>` (or fold into
-  `mount`) that, when `MOUNTED_OK && MOUNTED.root_len > 0`, returns the committed root
-  `{root_lba, root_len, root_hash}`; re-hash the on-disk bytes with `extent_content_hash(root_lba,
-  root_len)` and confirm it equals `root_hash` (a Merkle-style integrity check on the persisted root).
-- In `kernel/src/main.rs` (a boot self-test, root domain, pre-`sti`): after `mount`, call `recover`;
-  if a root exists, `capspace::mint_extent(root_lba, root_len, root_hash)` to RE-MINT the root Extent
-  cap from on-disk state, `cap_invoke(root_ext, X_READ)` to confirm it returns `root_hash`, and print
-  `objstore: recovered root Extent cptr=.. lba=.. len=.. hash=.. reverify=true`. (No cap-core change —
-  `mint_extent`/`extent_metadata` already exist. CPtrs are ephemeral, re-minted each boot from the
-  durable content hash; sealed persisted tokens are CAP_ABI §7, deferred.)
-- **Proof (2 runs on the persisted `/root/cairn-disk.img`):** run1 `put`s+commits → prints
-  `content-addressed match=true` with hash H at some lba. run2 `mount`+`recover` re-mints the root
-  Extent **from run1's committed superblock** (root_lba = run1's data lba) and prints the SAME hash H
-  with `reverify=true` — WITHOUT a new put having produced it. (The boot self-test still does its own
-  fresh `put`; INC6's new line specifically proves the PRIOR boot's root survived.) Watch for the
-  ordering: `recover` reads the root committed by the PREVIOUS boot (this boot's `put` runs after).
+## STEP 3 — Your task: Phase 3 INC7 — zero-kernel DeviceQueue grant + Extent MAP (T1, the namesake)
+INC6 (commit `8e66c0f`) closed T2 (objects survive reboot). INC7 is **T1**: the kernel leaves the I/O
+hot path after a one-time capability grant (DESIGN.md pillar 4) — **the first live use of
+`Rights::MAP`**. This is SUBTLE/DMA-adjacent: do a judged design panel + adversarial review (Workflow
+tool) before committing, and re-read the **no-IOMMU DMA trust boundary** in `docs/PHASE3.md` (a mapped
+DeviceQueue is write-anywhere DMA → grant ONLY to a TRUSTED driver domain in v0). cap-core stays
+byte-unchanged (`DeviceQueue=9`, `Rights::MAP` already exist — only USE them).
+- **Paging helpers** (`kernel/src/paging.rs`): `map_user_mmio_page` (a USER + NO_CACHE doorbell page)
+  and a **map-existing-phys-frame-at-user-VA** helper (the current `map_user_page` allocates a FRESH
+  frame, so it can't map the already-allocated ring frames — you need to map existing phys).
+- **DeviceQueue object** (`kernel/src/capspace.rs`, mirror `EXTENTS`/`ENDPOINTS` EXACTLY — const-static
+  side-table, never touch cap-core): `DQ_INFO=1`/`DQ_MAP=2`/`DQ_SUBMIT=3` ids; `DEVQUEUES:[DqMeta;
+  OBJECT_TABLE_SIZE]`; `create_device_queue`; wire `dispatch_method` `extra`-rights `(DeviceQueue,
+  DQ_MAP)=>MAP`, `(DeviceQueue,DQ_SUBMIT)=>WRITE`, `(DeviceQueue,DQ_INFO)=>READ`. `DQ_MAP` maps the
+  virtqueue rings + the doorbell page contiguously into a trusted driver domain (bump `MAX_DOMAINS`
+  5→6) and returns one base VA.
+- **Extent MAP**: extend the Extent path so `MAP` maps the named data sectors (from
+  `extent_metadata` — the seed) into a domain's address space (bytes reach a domain via MAP, never a
+  register, per CAP_ABI §5).
+- **Proof (boot-log):** a ring-3 driver blob, having received a `DeviceQueue` cap, fills a descriptor +
+  rings the doorbell + polls `used` with **ZERO syscalls** (true zero-kernel I/O); negative test: a
+  MAP-masked copy of the cap ⇒ `ErrRights`. Optional INC8 (may slip to Phase 4): `DQ_SUBMIT`
+  kernel-validated descriptors; IRQ completion (`IrqHandler` + `Notification`); VT-d scaffold.
 
-Then **INC7** (zero-kernel DeviceQueue grant + Extent MAP — the namesake pillar-4 milestone: first
-live use of `Rights::MAP`, maps ring+doorbell into a trusted driver domain, bumps `MAX_DOMAINS` 5→6;
-`extent_metadata` is the seed for Extent MAP). Full plan in `docs/PHASE3.md` INC6/INC7.
+Full plan + the no-IOMMU DMA trust boundary + the escalation ladder (v0 trust → v1 validated descs →
+v2 VT-d): `docs/PHASE3.md` INC7 + "DMA trust boundary".
 
 ## Hard rules — do not violate
 - **cap-core (`crates/cap-core`) is FROZEN and Kani-verified — NEVER edit it.**
@@ -130,5 +134,5 @@ management plane + TCB verification. Thesis: *everything is a capability over on
 substrate, and the kernel gets out of the data path.* Phase 3 makes that real (Extent caps over a
 log-structured store; DeviceQueue caps for kernel-free I/O at INC7).
 
-Start by reading `RESUME.md`, confirming the clean boot, then implementing INC6. Ask me nothing you
+Start by reading `RESUME.md`, confirming the clean boot, then implementing INC7. Ask me nothing you
 can answer from the repo — but do confirm direction before any large multi-agent workflow run.
