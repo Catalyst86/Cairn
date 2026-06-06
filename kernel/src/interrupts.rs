@@ -28,7 +28,13 @@ pub fn init_idt() {
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
 
-        idt.page_fault.set_handler_fn(page_fault_handler);
+        // #PF on its own IST stack so it can report a main-stack overflow (guard
+        // page hit) instead of double-faulting while pushing the exception frame.
+        unsafe {
+            idt.page_fault
+                .set_handler_fn(page_fault_handler)
+                .set_stack_index(gdt::PAGE_FAULT_IST_INDEX);
+        }
         idt.general_protection_fault.set_handler_fn(general_protection_handler);
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
 
@@ -70,6 +76,25 @@ extern "x86-interrupt" fn page_fault_handler(
     let fault_addr = x86_64::registers::control::Cr2::read()
         .map(|a| a.as_u64())
         .unwrap_or(0);
+
+    // Stack-overflow tripwire: a fault inside the unmapped guard page below the
+    // kernel stack means we ran out of stack. Report loudly and halt — do NOT fall
+    // through to the on-demand mapper (which would map the guard and mask the bug).
+    let guard = crate::stack_guard_base();
+    if (guard..guard + 0x1000).contains(&fault_addr) {
+        crate::serial_println!("EXCEPTION: KERNEL STACK OVERFLOW");
+        crate::serial_println!(
+            "  hit guard page at {:#x} (kernel stack exhausted)",
+            fault_addr
+        );
+        crate::serial_println!("{:#?}", stack_frame);
+        loop {
+            // SAFETY: controlled halt; running on the #PF IST stack.
+            unsafe {
+                core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+            }
+        }
+    }
 
     // Defensive backstop: on-demand-map a *not-present* kernel higher-half page.
     // Limine maps the whole kernel image (incl. .bss), so in normal operation this

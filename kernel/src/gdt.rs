@@ -14,6 +14,12 @@ use x86_64::VirtAddr;
 /// IST index for the double-fault handler stack (index 0 is the first IST entry).
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
+/// IST index for the page-fault handler stack. A separate, known-good stack lets
+/// the #PF handler run and report even when the main kernel stack is exhausted —
+/// e.g. an overflow into the guard page, which faults with RSP already at the
+/// guard boundary (pushing the frame on the current stack would re-fault → #DF).
+pub const PAGE_FAULT_IST_INDEX: u16 = 1;
+
 /// Static TSS. Initialized once via spin::Once so we can hand out a &'static ref
 /// to the GDT descriptor constructor.
 static TSS: Once<TaskStateSegment> = Once::new();
@@ -33,17 +39,18 @@ pub fn init() {
     let tss = TSS.call_once(|| {
         let mut tss = TaskStateSegment::new();
 
-        // Allocate a small stack for double-faults (20 KiB). Must be valid for the
-        // lifetime of the kernel; we use a static mut buffer.
+        // Dedicated stacks for fault handlers (20 KiB each). Must be valid for the
+        // lifetime of the kernel; we use static mut buffers. Grows down => use top.
         const STACK_SIZE: usize = 4096 * 5;
-        static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
+        static mut DF_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
+        static mut PF_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
 
-        // SAFETY: We never move or deallocate this stack. It is used only by the
-        // #DF handler on IST0. The address is stable for the life of the kernel.
-        // We write the *top* of the stack (grows down).
-        let stack_start = VirtAddr::from_ptr(unsafe { core::ptr::addr_of!(STACK) });
-        let stack_end = stack_start + STACK_SIZE as u64;
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = stack_end;
+        // SAFETY: We never move or deallocate these stacks. Each is used only by its
+        // handler on its IST slot; the addresses are stable for the kernel's life.
+        let df_top = VirtAddr::from_ptr(core::ptr::addr_of!(DF_STACK)) + STACK_SIZE as u64;
+        let pf_top = VirtAddr::from_ptr(core::ptr::addr_of!(PF_STACK)) + STACK_SIZE as u64;
+        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = df_top;
+        tss.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = pf_top;
 
         tss
     });

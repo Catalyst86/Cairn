@@ -4,9 +4,15 @@
 Cairn is a from-scratch, capability-based OS for James's HPE ProLiant x86-64 server,
 built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\Desktop\Cairn`.
 
-## Status (milestone: cap_invoke is LIVE)
-- ✅ **keystone boots cleanly in QEMU** (Phase 0/1): serial → GDT/IDT → **1 MiB Limine
-  boot stack** → frame allocator → 1 MB kernel heap → #BP exception recovery.
+## Status (milestone: cap_invoke is LIVE; stack hardened)
+- ✅ **keystone boots cleanly in QEMU** (Phase 0/1): serial → switch to a **512 KiB
+  guard-paged kernel stack** → GDT/IDT → frame allocator → 1 MB kernel heap → #BP
+  exception recovery.
+- ✅ **Stack-overflow hardening:** `kmain` switches RSP to a dedicated `KERNEL_STACK`
+  with an **unmapped guard page**; the #PF handler runs on its **own IST stack** and
+  reports `KERNEL STACK OVERFLOW` on a guard hit. Verified by a forced-overflow self-test
+  (caught loudly, no silent corruption). This is the durable fix for the bug class below;
+  the 1 MiB Limine `StackSizeRequest` now only covers the tiny pre-switch prologue.
 - ✅ **cap-core formally verified** — 4 Kani proofs, 343 checks, 0 failures
   (I2 revocation, I3 no-amplification, I4 invoke-requires-right, encode round-trip).
 - ✅ **`cap_invoke` is LIVE** (`kernel/src/capspace.rs` driving the verified cap-core).

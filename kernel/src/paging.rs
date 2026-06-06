@@ -122,6 +122,38 @@ pub fn manual_map(hhdm: u64, va: u64) -> bool {
     true
 }
 
+/// Unmap the 4 KiB page containing `va` by clearing its L1 entry in the active
+/// (Limine) hierarchy, then flushing the TLB. Used to install the kernel stack
+/// guard page: after this, any access to `va` takes a not-present page fault.
+///
+/// Deliberately does NOT free a backing frame — the guard page is part of a static
+/// (`.bss`), never came from the frame allocator, and we only want faults on touch.
+/// Returns false (nothing cleared) if an intermediate level is missing or huge.
+pub fn unmap_page(hhdm: u64, va: u64) -> bool {
+    let va = va & !0xfff;
+    let (l4f, _) = Cr3::read();
+    let mut table_phys = l4f.start_address().as_u64();
+
+    // Walk L4 -> L3 -> L2; each must be a present, non-huge table.
+    for shift in [39u32, 30, 21] {
+        let t = (hhdm + table_phys) as *const u64;
+        let idx = ((va >> shift) & 0x1ff) as usize;
+        let e = unsafe { core::ptr::read_volatile(t.add(idx)) };
+        if e & 1 == 0 || (e >> 7) & 1 == 1 {
+            return false;
+        }
+        table_phys = e & 0x000f_ffff_ffff_f000;
+    }
+
+    let l1 = (hhdm + table_phys) as *mut u64;
+    let i1 = ((va >> 12) & 0x1ff) as usize;
+    unsafe {
+        core::ptr::write_volatile(l1.add(i1), 0);
+        x86_64::instructions::tlb::flush(VirtAddr::new(va));
+    }
+    true
+}
+
 /// Ensure the 4 KiB page containing `addr` is mapped present+writable. If it is
 /// already mapped, this is a no-op; otherwise a fresh frame is allocated, mapped,
 /// and zeroed (bss must read as zero). Returns true if the page is mapped on exit.
