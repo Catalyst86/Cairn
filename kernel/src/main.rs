@@ -27,6 +27,7 @@ mod serial;
 mod syscall;
 mod user;
 
+use cap_core::capability::Rights;
 use limine::request::{HhdmRequest, MemmapRequest, StackSizeRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
@@ -243,6 +244,45 @@ unsafe extern "C" fn kmain_main() -> ! {
         None => serial_println!("init_root failed"),
     }
 
+    // --- per-domain CapTables + Notification (async IPC) self-test (Phase 2) ---
+    // Stands up the per-domain authority model live: mint in root (domain 0), delegate
+    // a rights-SUBSET copy into a second domain, and prove (a) verified delegate never
+    // amplifies (I3), (b) a CPtr is domain-relative (root's CPtr is meaningless in the
+    // other domain — isolation), and (c) a Notification carries data across a domain
+    // boundary via signal/poll with per-method rights enforced.
+    const DEMO_DOMAIN: usize = 2;
+    if let Some(root_mem) = capspace::init_root() {
+        // Delegate Memory with INVOKE only (root had READ|WRITE|INVOKE|MAP|DELEGATE).
+        if let Some(d2_mem) = capspace::delegate_from_root(DEMO_DOMAIN, root_mem, Rights::INVOKE, 0) {
+            let (d2_st, _) = capspace::cap_invoke_in(DEMO_DOMAIN, d2_mem, capspace::M_ALLOC, 0);
+            // The same integer that names a cap in ROOT does not resolve in domain 2.
+            let (iso_st, _) = capspace::cap_invoke_in(DEMO_DOMAIN, root_mem, capspace::M_ALLOC, 0);
+            serial_println!(
+                "perdomain: domain{} ALLOC via delegated(INVOKE-only) cap => {:?}; root CPtr {} in domain{} => {:?} (isolated)",
+                DEMO_DOMAIN, d2_st, root_mem, DEMO_DOMAIN, iso_st
+            );
+        } else {
+            serial_println!("perdomain: delegate_from_root failed");
+        }
+    }
+    if let Some(notif_root) = capspace::create_notification() {
+        // Delegate a SIGNAL-ONLY cap (INVOKE|WRITE, no READ) into domain 2.
+        if let Some(notif_d2) =
+            capspace::delegate_from_root(DEMO_DOMAIN, notif_root, Rights::INVOKE | Rights::WRITE, 0)
+        {
+            let (sig, _) = capspace::cap_invoke_in(DEMO_DOMAIN, notif_d2, capspace::N_SIGNAL, 0b101);
+            // domain 2's cap has no READ → POLL must be refused (ErrRights).
+            let (deny, _) = capspace::cap_invoke_in(DEMO_DOMAIN, notif_d2, capspace::N_POLL, 0);
+            // root holds READ → observes the bits domain 2 raised; a second poll clears.
+            let (p1_st, p1) = capspace::cap_invoke_in(0, notif_root, capspace::N_POLL, 0);
+            let (_, p2) = capspace::cap_invoke_in(0, notif_root, capspace::N_POLL, 0);
+            serial_println!(
+                "notify: domain{} SIGNAL=>{:?} POLL(no READ)=>{:?}; root POLL=>{:?} bits={:#b} then {:#b}",
+                DEMO_DOMAIN, sig, deny, p1_st, p1, p2
+            );
+        }
+    }
+
     // --- Phase 2: EDF over BOTH ring-0 and ring-3 tasks, off the APIC timer ---
     // Mint a Memory capability the ring-3 task will invoke; map its user code+stack;
     // admit one kernel (ring-0) task and one userspace (ring-3) task — both gated by a
@@ -251,8 +291,14 @@ unsafe extern "C" fn kmain_main() -> ! {
     if apic::init_timer(hhdm_offset) {
         sched::init();
 
-        // Memory cap for the ring-3 task to cap_invoke(M_ALLOC).
-        let mem_cptr = capspace::init_root();
+        // Memory cap for the ring-3 task: mint in root, then DELEGATE an INVOKE-only
+        // copy into the task's OWN domain (1). The task runs in domain 1, so its
+        // syscalls resolve this CPtr against its own per-domain table (first live use
+        // of the verified `delegate`). mem_cptr is therefore domain-1-relative.
+        const USER_DOMAIN: usize = 1;
+        let mem_cptr = capspace::init_root().and_then(|root_mem| {
+            capspace::delegate_from_root(USER_DOMAIN, root_mem, Rights::INVOKE, 0)
+        });
 
         // Admit ONE ring-3 (userspace) EDF task that makes real cap_invoke syscalls.
         // (Run solo besides idle so it isn't starved — the current EDF tie-break favors
@@ -260,10 +306,12 @@ unsafe extern "C" fn kmain_main() -> ! {
         // out. Fair co-scheduling = a later scheduler refinement.)
         match (mem_cptr, capspace::mint_timeslice(), user::setup_user_demo(hhdm_offset)) {
             (Some(mc), Some(tc), Some((entry, ustack))) => {
-                match sched::admit_user(entry, ustack, mc, tc, 5_000_000, 5_000_000, 1_000_000) {
+                match sched::admit_user(
+                    entry, ustack, mc, tc, USER_DOMAIN as u16, 5_000_000, 5_000_000, 1_000_000,
+                ) {
                     Some(i) => serial_println!(
-                        "EDF: admitted ring-3 user task (T=5ms) as task {}; entry={:#x} mem_cptr={}",
-                        i, entry, mc
+                        "EDF: admitted ring-3 user task (T=5ms) as task {} in domain {}; entry={:#x} mem_cptr={}",
+                        i, USER_DOMAIN, entry, mc
                     ),
                     None => serial_println!("EDF: admit_user failed"),
                 }

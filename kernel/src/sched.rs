@@ -43,6 +43,10 @@ struct Task {
     // from ring 3 lands (TSS.rsp0 + PerCpu.kernel_rsp0). For a ring-0 task this is
     // also where it runs; for a ring-3 task its run stack is a separate user stack.
     kstack_top: u64,
+    // Protection domain id (index into capspace per-domain CapTables). A ring-3 task
+    // runs in its own domain so its CPtrs resolve against its own table; ring-0/idle
+    // use domain 0 (root). The scheduler publishes this to capspace on each switch.
+    domain: u16,
 }
 
 impl Task {
@@ -57,6 +61,7 @@ impl Task {
         activations: 0,
         deadline_misses: 0,
         kstack_top: 0,
+        domain: 0,
     };
 }
 
@@ -190,6 +195,7 @@ pub fn admit(
             activations: 0,
             deadline_misses: 0,
             kstack_top: task_kstack_top(i),
+            domain: 0, // ring-0 kernel task runs in the root domain
         };
         s.num += 1;
         Some(i)
@@ -207,6 +213,7 @@ pub fn admit_user(
     user_stack_top: u64,
     mem_cptr: u16,
     cptr: u16,
+    domain: u16,
     period_ns: u64,
     rel_deadline_ns: u64,
     budget_ns: u64,
@@ -235,6 +242,7 @@ pub fn admit_user(
             activations: 0,
             deadline_misses: 0,
             kstack_top: task_kstack_top(i),
+            domain,
         };
         s.num += 1;
         Some(i)
@@ -254,6 +262,7 @@ extern "C" fn schedule_tick(current_rsp: u64) -> u64 {
         let s = &mut *core::ptr::addr_of_mut!(SCHED);
         if s.num <= 1 {
             set_kernel_stack(s.tasks[s.current].kstack_top); // defensive (no ring-3 task yet)
+            crate::capspace::set_current_domain(s.tasks[s.current].domain);
             return current_rsp; // nothing else to run; resume the same task
         }
         let now = now_ns();
@@ -269,6 +278,9 @@ extern "C" fn schedule_tick(current_rsp: u64) -> u64 {
         // syscall or privilege-changing interrupt from it lands on ITS stack (never a
         // stale/other task's). Load-bearing for ring-3 correctness.
         set_kernel_stack(s.tasks[n].kstack_top);
+        // Publish the incoming task's protection domain so its ring-3 syscalls resolve
+        // CPtrs against its own per-domain CapTable.
+        crate::capspace::set_current_domain(s.tasks[n].domain);
         s.tasks[n].rsp
     }
 }
