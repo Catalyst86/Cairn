@@ -6,19 +6,48 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
 
 ## ⏭ Next session — start here
 1. **Confirm the clean boot** still works: `wsl.exe -d Ubuntu -- bash /mnt/c/WSL/cairn-go-kernel.sh`
-   — expect the `perdomain:` + `notify:` proof lines, `EDF: admitted ring-3 user task … in
-   domain 1`, and `ring3 syscall #1..#8: cap_invoke(cptr=0, …) => Ok` with no faults.
-2. **Build portal IPC step 4b — Endpoints (sync rendezvous) + scheduler block/wake + a 2nd
-   ring-3 task.** Full plan + the cap-core constraints to respect are in `docs/PORTAL_IPC.md`
-   ("Increment 4b"). The hard part is the scheduler **block/wake** primitive
-   (`block_current`/`unblock`) cooperating with EDF `pick_next`/`roll_deadlines` without ever
-   losing a wakeup; then **Endpoint** `E_SEND`/`E_RECV` rendezvous, optional **cap-transfer**
-   via the syscall `xfer` slot (currently stubbed in `syscall_dispatch`, gated on `GRANT_CAP`),
-   and a **client+server** two-domain ring-3 demo. Good Claude×Grok split (Grok drafts the
-   rendezvous state machine; Claude integrates block/wake + cap-transfer, reviews unsafe,
-   verifies). **cap-core stays byte-unchanged** (its 4 Kani proofs must keep holding).
-3. git HEAD at handoff = the per-domain/Notification commit `9bd7246` (run `git log --oneline -8`);
-   ring-3 hardening (M_FREE gate) `6dda246` is the commit before it.
+   — expect the `perdomain:`/`notify:` lines, then the endpoint IPC proof: `ep: domain2 E_RECV
+   parked` → `ep: domain1 E_SEND … rendezvous, woke recv task=1 recv_cptr=3` → `ep: domain2
+   E_RECV resumed => … msg=0xca11 recv_cptr=3` → server `M_ALLOC` on slot 3 `Ok`, client
+   `M_ALLOC` on the granted-away slot ⇒ `status=1` (ErrBadCPtr) — and no faults.
+2. **Next step = crash-only domain supervision** (the Roadmap item after portal IPC; the
+   "reliability story"): kill a misbehaving/faulting ring-3 domain, **revoke its caps**
+   (epoch bump — verified I2), reclaim its task slot + frozen kernel stack + any endpoint it
+   was parked on, and restart it; clients hold their own checkpoint caps. Today a ring-3
+   `#GP`/`#PF` is fatal (halts the kernel) — change those handlers to terminate just the
+   offending task. Watch: a destroyed task that was `EpState::SendWait/RecvWait` must be
+   cleared from `ENDPOINTS[oid]` so a partner doesn't wake a dead task.
+   - **Optional 4c IPC polish first** (smaller, see `docs/PORTAL_IPC.md` "Deferred to 4c"):
+     blocking `N_WAIT` (block/wake + `NWAITER[oid]`, wake from `notify_signal`); multi-waiter
+     endpoint queues; directed hand-off on unblock; re-anchor a long-blocked task's stale EDF
+     deadline. The block/wake primitive (`sched::block_current`/`unblock`) is built and proven.
+3. **cap-core stays byte-unchanged** (its 4 Kani proofs are the regression gate; re-run via
+   `kani-proofs.sh`). git HEAD at handoff = the portal-IPC-4b commit `cffbc81` (run
+   `git log --oneline -8`); 4a per-domain/Notification `9bd7246` precedes it.
+
+## Status (Phase 2: blocking endpoint IPC + scheduler block/wake — step 4b) ✅
+- ✅ **Synchronous Endpoint IPC across two ring-3 domains, with block/wake + cap-transfer**
+  (commit `cffbc81`; `docs/PORTAL_IPC.md`). **Designed via a judged 4-way design panel, then
+  put through a 5-dimension adversarial review** (7 findings, all one root cause — cap-transfer
+  error/sentinel handling — fixed; the block/wake asm + lost-wakeup logic drew ZERO findings).
+  - **Scheduler block/wake** (`sched.rs`): `block_current` parks the running task *inside its
+    syscall* and switches to the earliest-deadline peer; `unblock` stages the IPC result then
+    clears an INDEPENDENT `blocked` gate (deliver-before-unblock). One new naked routine
+    `block_and_switch` saves the blocked task as the **exact same 20-u64 frame** `timer_isr`/
+    `build_task_frame_inner` use (resumable by the timer OR a peer's switch via one identical
+    pop+iretq tail), resuming at a kernel `resume_point` (kernel CS/SS, IF=0). **GS-neutral**
+    paired `swapgs` keeps active GS correct for every incoming task. `pick_next` skips blocked;
+    `roll_deadlines` won't re-arm a blocked task. Lost-wakeup-free by IF=0-whole-syscall atomicity.
+  - **Endpoint** (`capspace.rs`): `E_SEND`/`E_RECV` single-waiter rendezvous (fast handoff if the
+    partner is parked, else block); state in `ENDPOINTS[oid]` (mirrors `NOTIFY`). One scalar
+    message word + optional **capability transfer** via the syscall `xfer` slot, two-key gated
+    (`GRANT_CAP` channel + `DELEGATE` moved cap), MOVE = verified `delegate(all)` + clear source,
+    **atomic with the rendezvous** (a failed grant aborts both, never reports Ok). `reply_cptr`
+    returns in rdx via `PER_CPU.reply_cptr@16`. Single `CPTR_NULL` sentinel; `xfer` range-checked.
+  - **Verified in QEMU:** server parks on E_RECV → client E_SEND rendezvous wakes it → server
+    RESUMES inside the syscall (`recv_cptr=3`) → moved cap works in domain 2 (`M_ALLOC=>Ok`) →
+    client's granted-away slot ⇒ `ErrBadCPtr` (MOVE) → `E_SEND` w/o GRANT_CAP ⇒ `ErrRights`. 4a
+    proofs intact; no faults. **cap-core byte-unchanged** (4 Kani proofs are the regression gate).
 
 ## Status (Phase 2: per-domain CapTables + Notification async IPC — step 4a) ✅
 - ✅ **Per-domain CapTables + Notification IPC live** (portal-IPC step 4a; `docs/PORTAL_IPC.md`).
@@ -198,9 +227,10 @@ backstop. Building keystone's own page tables is now OPTIONAL polish, not a bloc
 ## Roadmap (Phase 2 underway)
 APIC timer ✅ → preemptive round-robin scheduler ✅ → EDF policy + time-caps ✅ →
 ring 3 + syscall + first userspace cap_invoke ✅ → ring-3 hardening (M_FREE gate) ✅ →
-per-domain CapTables + Notification async IPC ✅ (step 4a) → **portal IPC endpoints (sync
-rendezvous) + scheduler block/wake + 2nd ring-3 task — NEXT (step 4b, see docs/PORTAL_IPC.md)**
-→ crash-only domain supervision → Phase 3 (zero-kernel I/O + object store) →
+per-domain CapTables + Notification async IPC ✅ (step 4a) → portal IPC endpoints (sync
+rendezvous) + scheduler block/wake + cap-transfer + 2nd ring-3 task ✅ (step 4b) →
+**crash-only domain supervision — NEXT** (optional 4c IPC polish first: N_WAIT/multi-waiter,
+see docs/PORTAL_IPC.md) → Phase 3 (zero-kernel I/O + object store) →
 Ring-3 follow-ups (deferred, see commit): fair co-scheduling (round-robin on equal EDF
 deadlines — currently lowest-index wins, so a co-scheduled shorter-period task starves the
 user task; demo runs the ring-3 task solo), return a Memory CPtr not a raw frame number to
