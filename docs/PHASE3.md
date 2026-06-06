@@ -65,7 +65,11 @@ ephemeral — sealed sparse 128-bit persisted tokens are CAP_ABI §7, deferred).
 - **INC1 — PCI enumeration ✅ DONE** (`pci.rs`, commit pending): legacy `0xCF8/0xCFC` scan of
   bus 0, BAR decode/size (32/64-bit + I/O), flags the virtio-blk. Verified: lists host bridge,
   VGA, e1000, **virtio-blk `0x1af4:0x1042`** (bar1 mmio32 0x1000, bar4 mmio64 0x4000), AHCI, SMBus.
-- **INC2 — virtio-blk MVP (kernel-side, polled):** `map_mmio_range` (idempotent, translate-first
+- **INC2 — virtio-blk MVP (kernel-side, polled) ✅ DONE** (`virtio_blk.rs`, `pci.rs` helpers,
+  `paging::map_mmio_range`; commit `fc748d5`). Reads LBA0 via DMA → magic match. `read_sector(lba,
+  &mut [u8;512])` is the reusable L2 primitive. Review-hardened (timeout→device-disable + exact
+  completion target; qsize ring indexing; u16 cap offsets; bounded reset). Original plan:
+  `map_mmio_range` (idempotent, translate-first
   like `map_one_page` — `map_mmio` is single-page and false-fails on already-mapped; virtio cfg
   windows share pages); walk the virtio PCI capability list (cap id 0x09, cfg_type 1/2/3/4 →
   bar+offset+len, notify_off_multiplier); negotiate modern virtio-1.0 (reset→ACK→DRIVER→

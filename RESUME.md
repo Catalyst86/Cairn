@@ -14,27 +14,26 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    the `perdomain:`/`notify:`/`GRANT_CAP gate` lines — **no panic/halt** anywhere (≈66 serial
    lines: 3 terminations, 2 restarts).
 2. **Phase 3 is UNDERWAY** (zero-kernel I/O + object store; architected in `docs/PHASE3.md`).
-   **INC1 (PCI enumeration) ✅ DONE** (`pci.rs`). **NEXT = INC2: virtio-blk MVP** (kernel-side,
-   polled): add an idempotent `map_mmio_range` (translate-first like `map_one_page` — `map_mmio`
-   false-fails on already-mapped, and virtio cfg windows share pages); walk the virtio PCI
-   capability list (cap id 0x09) and map the cfg windows off `bar4` (mmio64 @0xfe000000, size
-   0x4000) / `bar1`; negotiate modern virtio-1.0 (+`VIRTIO_BLK_F_FLUSH`); set up ONE split
-   virtqueue from `allocate_frame`'d frames (program queue/descriptor addrs as RAW guest-phys =
-   `frame*4096`, touch rings via HHDM — the #1 footgun); do a `VIRTIO_BLK_T_IN` read of LBA0 and
-   poll `used.idx` with an apic-style anti-hang guard. **Proof:** print the pre-seeded sector-0
-   magic `CAIRN-DISK-SECTOR-0-MAGIC-v0`. Full INC2..INC7 roadmap (→ "objects survive reboot" at
-   INC6, → zero-kernel DeviceQueue at INC7) + the DMA trust boundary + crash-consistency design
-   are in `docs/PHASE3.md`. cap-core stays byte-unchanged (Extent=8/DeviceQueue=9 already exist).
-   - **Or small Phase-2 polish first** (`docs/CRASH_ONLY.md`/`PORTAL_IPC.md` "deferred"):
-     survivor-liveness scrub, per-domain frame reclamation on death, blocking `N_WAIT`,
-     multi-waiter endpoints.
+   **INC1 (PCI enum) ✅** + **INC2 (polled virtio-blk driver) ✅** — the kernel reads a sector
+   off the disk via DMA (`virtio_blk::read_sector(lba, &mut [u8;512])` is the reusable L2 block
+   primitive). **NEXT = INC3: one-sector WRITE round-trip** — add `VIRTIO_BLK_T_OUT` to
+   `virtio_blk.rs` (a `write_sector(lba, &[u8;512])`; the request header type field switches to
+   1, and the data descriptor drops the `WRITE` flag — the device READS it). Smoke test: write a
+   pattern to LBA 8, read it back, `memcmp`. **Then INC4** (Cairnlog A/B superblock + FNV-1a
+   content hash; needs `VIRTIO_BLK_T_FLUSH` — negotiate `VIRTIO_BLK_F_FLUSH` in `init`), **INC5**
+   (append-log store + Extent caps wired into `dispatch_method`), **INC6** (objects survive
+   reboot — the `/root/cairn-disk.img` persists across runs), **INC7** (zero-kernel DeviceQueue
+   grant). Full plan + DMA trust boundary + crash-consistency: `docs/PHASE3.md`. cap-core stays
+   byte-unchanged (Extent=8/DeviceQueue=9 already exist).
+   - **Or small Phase-2 polish** (`docs/CRASH_ONLY.md`/`PORTAL_IPC.md` "deferred"):
+     survivor-liveness scrub, per-domain frame reclamation on death, blocking `N_WAIT`.
 3. **cap-core stays byte-unchanged** (the regression gate; `git diff HEAD -- crates/` must be
    empty). NOTE: `kani-proofs.sh` HANGS on the frame-alloc proofs (a prior session left stale
    `cbmc` running — kill any `cbmc`/`cargo-kani`/`kani-driver` by NAME first: `pkill -9 cbmc`,
    NOT `-f` which self-matches the kill command). cap-core's 4 proofs already pass; to re-confirm
    run ONLY `cargo kani -p cap-core --features kani`. At handoff the last FEATURE commit is
-   Phase 3 INC1 (PCI enum) `4218ace` (HEAD is the RESUME-update commit after it; run
-   `git log --oneline -14`).
+   Phase 3 INC2 (virtio-blk) `fc748d5` (HEAD is the RESUME-update commit after it; run
+   `git log --oneline -16`).
 
 ## Status (Phase 3: zero-kernel I/O + object store — UNDERWAY) 🚧
 - ✅ **INC1 — PCI bus enumeration** (commit `4218ace`; `pci.rs`, `docs/PHASE3.md`). Architected
@@ -44,9 +43,16 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
   `0x1af4:0x1042`** (bar4 mmio64 @0xfe000000 size 0x4000 — the cfg window INC2 maps), AHCI, SMBus;
   correct BAR sizes; Phase-2 boot intact; no faults. The QEMU virtio-blk disk + `disable-legacy=on`
   are wired in `C:\WSL\cairn-go-kernel.sh` (persistent `/root/cairn-disk.img`, magic sector 0).
-- 🚧 **NEXT = INC2 virtio-blk MVP** then INC3..INC7 → "objects survive reboot" (INC6) → zero-kernel
-  DeviceQueue grant (INC7). Architecture, cap-mapping (Extent=8/DeviceQueue=9, cap-core unchanged),
-  DMA trust boundary (no IOMMU → trusted driver domain), and crash-consistency: `docs/PHASE3.md`.
+- ✅ **INC2 — polled virtio-blk driver** (commit `fc748d5`; `virtio_blk.rs`). Modern virtio-1.0:
+  PCI cap walk → map cfg windows (`paging::map_mmio_range`) → negotiate VERSION_1 → one split
+  virtqueue → polled `VIRTIO_BLK_T_IN`. Reads sector 0 via DMA: `read LBA0 magic="CAIRN-DISK-
+  SECTOR-0-MAGIC-v0" match=true`. `pci.rs` gained pub cfg helpers + `find_virtio_blk`/`bar_base`/
+  `enable_bus_master`. Focused review (4 fixed: HIGH timeout-stale-state → device-disable +
+  exact completion target; qsize ring indexing; u16 cap offsets; bounded reset). `read_sector` is
+  the reusable L2 primitive. DMA = raw guest-phys, rings via HHDM.
+- 🚧 **NEXT = INC3 write round-trip** → INC4 superblock → INC5 Extent caps → INC6 objects-survive-
+  reboot → INC7 zero-kernel DeviceQueue grant. Architecture, cap-mapping (Extent=8/DeviceQueue=9,
+  cap-core unchanged), DMA trust boundary, crash-consistency: `docs/PHASE3.md`.
 
 ## Status (Phase 2: crash-only domain supervision + restart) ✅
 - ✅ **Restart / self-healing** (commit `a1b37bf`; `supervisor.rs`): `terminate_current` calls
@@ -290,9 +296,9 @@ per-domain CapTables + Notification async IPC ✅ (step 4a) → portal IPC endpo
 rendezvous) + scheduler block/wake + cap-transfer + 2nd ring-3 task ✅ (step 4b) →
 crash-only domain supervision (ring-3 fault terminates the domain, not the kernel) ✅ →
 crash-only restart / self-healing (supervisor re-admits under a budget) ✅ (Phase 2 COMPLETE) →
-**Phase 3 — zero-kernel I/O + object store: PCI enum ✅ (INC1) → virtio-blk MVP (INC2, NEXT) →
-block layer → Cairnlog store → Extent caps → objects-survive-reboot (INC6) → DeviceQueue
-zero-kernel grant (INC7); see docs/PHASE3.md** →
+**Phase 3 — zero-kernel I/O + object store: PCI enum ✅ (INC1) → polled virtio-blk driver ✅
+(INC2) → write round-trip (INC3, NEXT) → Cairnlog store → Extent caps → objects-survive-reboot
+(INC6) → DeviceQueue zero-kernel grant (INC7); see docs/PHASE3.md** →
 Ring-3 follow-ups (deferred, see commits): fair co-scheduling (the demo now co-schedules
 faulter+client+server across domains and works, but equal EDF deadlines are still broken by
 lowest-index — no round-robin among equal deadlines), return a Memory CPtr (not a raw frame) to
