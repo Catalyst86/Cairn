@@ -20,6 +20,7 @@ mod apic;
 mod gdt;
 mod interrupts;
 mod memory;
+mod objstore;
 mod paging;
 mod pci;
 mod capspace;
@@ -211,8 +212,11 @@ unsafe extern "C" fn kmain_main() -> ! {
     // Discovers the virtio-blk device + its MMIO BARs (the config window the driver maps next).
     pci::scan();
 
-    // --- Phase 3 (L1): bring up the virtio-blk driver + read LBA 0 (polled, IRQs off) ---
+    // --- Phase 3 (L1): bring up the virtio-blk driver + L2 read/write round-trip ---
     virtio_blk::smoke_test(hhdm_offset);
+
+    // --- Phase 3 (L3): mount the Cairnlog object store (format on first boot) ---
+    objstore::mount();
 
     // --- self-tests (as specified) ---
 

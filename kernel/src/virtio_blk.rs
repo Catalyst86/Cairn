@@ -45,6 +45,8 @@ const S_FEATURES_OK: u8 = 8;
 
 // VIRTIO_F_VERSION_1 = feature bit 32 = bit 0 of the high (select=1) feature dword.
 const VIRTIO_F_VERSION_1_HI: u32 = 1 << 0;
+// VIRTIO_BLK_F_FLUSH = feature bit 9 (low dword) — a flushable volatile write cache.
+const VIRTIO_BLK_F_FLUSH_BIT: u32 = 1 << 9;
 
 // --- virtq descriptor flags ---
 const VIRTQ_DESC_F_NEXT: u16 = 1;
@@ -53,6 +55,7 @@ const VIRTQ_DESC_F_WRITE: u16 = 2;
 // --- virtio-blk request types ---
 const VIRTIO_BLK_T_IN: u32 = 0; // read (device writes the data buffer)
 const VIRTIO_BLK_T_OUT: u32 = 1; // write (device reads the data buffer)
+const VIRTIO_BLK_T_FLUSH: u32 = 4; // flush the device's volatile write cache (no data)
 const SECTOR: u64 = 512;
 
 /// Clamp the queue to keep desc/avail/used each within a single 4 KiB frame
@@ -76,6 +79,7 @@ struct VirtioBlk {
     data: u64,   // virt of the 512-byte data buffer
     status: u64, // virt of the 1-byte status
     qsize: u16,  // device-negotiated queue size (NOT the QSIZE clamp) — used for ring indexing
+    flush_ok: bool, // VIRTIO_BLK_F_FLUSH negotiated (device has a flushable cache)
 }
 
 static mut VBLK: VirtioBlk = VirtioBlk {
@@ -94,6 +98,7 @@ static mut VBLK: VirtioBlk = VirtioBlk {
     data: 0,
     status: 0,
     qsize: 0,
+    flush_ok: false,
 };
 
 // --- volatile MMIO/RAM accessors ---
@@ -208,16 +213,21 @@ pub fn init(hhdm: u64) -> bool {
         w8(common + CC_DEVICE_STATUS, S_ACK);
         w8(common + CC_DEVICE_STATUS, S_ACK | S_DRIVER);
 
-        // Feature negotiation: require VIRTIO_F_VERSION_1 (high dword bit0). Accept no
-        // low-dword features for the v0 read (FLUSH etc. arrive with the store, INC4).
+        // Feature negotiation: read offered features (low + high dwords), require
+        // VIRTIO_F_VERSION_1 (mandatory for modern), and accept VIRTIO_BLK_F_FLUSH if
+        // offered (durable commits for the object store).
+        w32(common + CC_DEVICE_FEATURE_SELECT, 0);
+        let dev_lo = r32(common + CC_DEVICE_FEATURE);
         w32(common + CC_DEVICE_FEATURE_SELECT, 1);
         let dev_hi = r32(common + CC_DEVICE_FEATURE);
         if dev_hi & VIRTIO_F_VERSION_1_HI == 0 {
             crate::serial_println!("virtio-blk: device is not virtio-1.0");
             return false;
         }
+        let drv_lo = dev_lo & VIRTIO_BLK_F_FLUSH_BIT;
+        let flush_ok = drv_lo != 0;
         w32(common + CC_DRIVER_FEATURE_SELECT, 0);
-        w32(common + CC_DRIVER_FEATURE, 0);
+        w32(common + CC_DRIVER_FEATURE, drv_lo);
         w32(common + CC_DRIVER_FEATURE_SELECT, 1);
         w32(common + CC_DRIVER_FEATURE, VIRTIO_F_VERSION_1_HI);
 
@@ -278,6 +288,7 @@ pub fn init(hhdm: u64) -> bool {
         v.data = buf + 512;
         v.status = buf + 1024;
         v.qsize = qsize;
+        v.flush_ok = flush_ok;
         v.present = true;
 
         // DRIVER_OK — device is live.
@@ -301,7 +312,7 @@ pub fn init(hhdm: u64) -> bool {
 ///
 /// SAFETY: single-CPU, IRQs off; sole accessor of the queue. Device-facing addresses are
 /// raw guest-physical; ring/buffer memory is touched via its HHDM alias.
-unsafe fn submit(req_type: u32, lba: u64) -> bool {
+unsafe fn submit(req_type: u32, lba: u64, has_data: bool) -> bool {
     let v = &mut *core::ptr::addr_of_mut!(VBLK);
     if !v.present {
         return false;
@@ -314,22 +325,32 @@ unsafe fn submit(req_type: u32, lba: u64) -> bool {
     w64(v.hdr + 8, lba);
     w8(v.status, 0xFF); // device overwrites with 0 = OK
 
-    // 3-descriptor chain: hdr (device reads) -> data -> status (device writes). The data
-    // descriptor's WRITE flag means "device writes it" — set only for a READ.
+    // Descriptor chain: hdr (device reads) -> [data] -> status (device writes). FLUSH has
+    // no data buffer, so it chains hdr -> status directly.
     let d = v.desc;
     w64(d, v.hdr_phys);
     w32(d + 8, 16);
     w16(d + 12, VIRTQ_DESC_F_NEXT);
     w16(d + 14, 1);
-    let data_flags = VIRTQ_DESC_F_NEXT | if data_dev_writes { VIRTQ_DESC_F_WRITE } else { 0 };
-    w64(d + 16, v.data_phys);
-    w32(d + 16 + 8, SECTOR as u32);
-    w16(d + 16 + 12, data_flags);
-    w16(d + 16 + 14, 2);
-    w64(d + 32, v.status_phys);
-    w32(d + 32 + 8, 1);
-    w16(d + 32 + 12, VIRTQ_DESC_F_WRITE);
-    w16(d + 32 + 14, 0);
+    if has_data {
+        // desc[1]: data. WRITE flag = "device writes it" — set only for a READ.
+        let data_flags = VIRTQ_DESC_F_NEXT | if data_dev_writes { VIRTQ_DESC_F_WRITE } else { 0 };
+        w64(d + 16, v.data_phys);
+        w32(d + 16 + 8, SECTOR as u32);
+        w16(d + 16 + 12, data_flags);
+        w16(d + 16 + 14, 2);
+        // desc[2]: status.
+        w64(d + 32, v.status_phys);
+        w32(d + 32 + 8, 1);
+        w16(d + 32 + 12, VIRTQ_DESC_F_WRITE);
+        w16(d + 32 + 14, 0);
+    } else {
+        // desc[1]: status (no data descriptor).
+        w64(d + 16, v.status_phys);
+        w32(d + 16 + 8, 1);
+        w16(d + 16 + 12, VIRTQ_DESC_F_WRITE);
+        w16(d + 16 + 14, 0);
+    }
 
     // Avail ring: publish head descriptor 0 at the current idx, then bump idx. Slot uses the
     // DEVICE-negotiated queue size (v.qsize), not the QSIZE clamp.
@@ -376,7 +397,7 @@ unsafe fn submit(req_type: u32, lba: u64) -> bool {
 pub fn read_sector(lba: u64, dst: &mut [u8; 512]) -> bool {
     // SAFETY: single-CPU, IRQs off; sole queue accessor.
     unsafe {
-        if !submit(VIRTIO_BLK_T_IN, lba) {
+        if !submit(VIRTIO_BLK_T_IN, lba, true) {
             return false;
         }
         let v = &*core::ptr::addr_of!(VBLK);
@@ -395,7 +416,24 @@ pub fn write_sector(lba: u64, src: &[u8; 512]) -> bool {
         }
         // Stage the data into the device-facing buffer, then submit an OUT.
         core::ptr::copy_nonoverlapping(src.as_ptr(), v.data as *mut u8, 512);
-        submit(VIRTIO_BLK_T_OUT, lba)
+        submit(VIRTIO_BLK_T_OUT, lba, true)
+    }
+}
+
+/// Flush the device's volatile write cache to durable storage. Required before a commit
+/// is considered durable (serialized completion is ordering, not durability, under QEMU's
+/// writeback cache). No-op (returns true) if the device advertised no flushable cache.
+pub fn flush() -> bool {
+    // SAFETY: single-CPU, IRQs off; sole queue accessor.
+    unsafe {
+        let v = &*core::ptr::addr_of!(VBLK);
+        if !v.present {
+            return false;
+        }
+        if !v.flush_ok {
+            return true;
+        }
+        submit(VIRTIO_BLK_T_FLUSH, 0, false)
     }
 }
 
@@ -404,28 +442,18 @@ pub fn smoke_test(hhdm: u64) {
     if !init(hhdm) {
         return;
     }
-    let mut buf = [0u8; 512];
-    if !read_sector(0, &mut buf) {
-        return;
-    }
-    // The boot script pre-seeds sector 0 with "CAIRN-DISK-SECTOR-0-MAGIC-v0".
-    let n = 28usize;
-    let ok = &buf[..n] == b"CAIRN-DISK-SECTOR-0-MAGIC-v0";
-    // Print the magic as text (bytes are ASCII).
-    crate::serial_print!("virtio-blk: read LBA0 magic=\"");
-    for &b in &buf[..n] {
-        let c = if (0x20..0x7f).contains(&b) { b } else { b'.' };
-        crate::serial_print!("{}", c as char);
-    }
-    crate::serial_println!("\" match={}", ok);
-
-    // INC3: write/read round-trip on LBA 8 (away from the magic sector) — the L2 block
-    // primitive the Cairnlog store rides on.
+    // LBA 0/1 are claimed by the Cairnlog superblock (objstore), so the L2 read+write
+    // proof uses LBA 8 — a round-trip exercises both the read and write paths.
     let mut wbuf = [0u8; 512];
     for (i, b) in wbuf.iter_mut().enumerate() {
         *b = (i as u8) ^ 0xA5;
     }
     let mut rbuf = [0u8; 512];
     let rt = write_sector(8, &wbuf) && read_sector(8, &mut rbuf) && wbuf == rbuf;
-    crate::serial_println!("virtio-blk: wrote+read LBA8 512B match={}", rt);
+    // SAFETY: scalar read of the driver flag, single-CPU IRQs off.
+    let flush_ok = unsafe { (*core::ptr::addr_of!(VBLK)).flush_ok };
+    crate::serial_println!(
+        "virtio-blk: wrote+read LBA8 512B match={} (flush negotiated={})",
+        rt, flush_ok
+    );
 }
