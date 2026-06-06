@@ -77,7 +77,8 @@ ephemeral — sealed sparse 128-bit persisted tokens are CAP_ABI §7, deferred).
   `allocate_frame`'d frames (program queue addrs as RAW guest-phys=`frame*4096`, touch rings via
   HHDM — the #1 footgun); 3-desc `VIRTIO_BLK_T_IN` read of LBA0; poll used.idx with an apic-style
   anti-hang guard. **Proof:** print the pre-seeded sector-0 magic `CAIRN-DISK-SECTOR-0-MAGIC-v0`.
-- **INC3 — one-sector WRITE round-trip** (`VIRTIO_BLK_T_OUT` LBA8 then read back + memcmp). L2 block primitive.
+- **INC3 — one-sector WRITE round-trip ✅ DONE** (commit `b782c2f`): `write_sector` via a shared
+  `submit()`; `wrote+read LBA8 512B match=true`. L2 block layer (read+write) complete.
 - **INC4 — Cairnlog superblock + checksums** (FNV-1a first; A/B superblock; format-on-first-boot).
 - **INC5 — append-log store v0 + Extent caps** (`objstore::put`; `X_READ`/`X_WRITE`/`X_COMMIT` arms).
 - **INC6 — OBJECTS SURVIVE REBOOT (T2 milestone):** run1 puts+commits, prints hashes; QEMU exits
