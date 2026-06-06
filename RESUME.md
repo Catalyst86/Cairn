@@ -6,24 +6,51 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
 
 ## ⏭ Next session — start here
 1. **Confirm the clean boot** still works: `wsl.exe -d Ubuntu -- bash /mnt/c/WSL/cairn-go-kernel.sh`
-   — expect the `perdomain:`/`notify:` lines, then the endpoint IPC proof: `ep: domain2 E_RECV
-   parked` → `ep: domain1 E_SEND … rendezvous, woke recv task=1 recv_cptr=3` → `ep: domain2
-   E_RECV resumed => … msg=0xca11 recv_cptr=3` → server `M_ALLOC` on slot 3 `Ok`, client
-   `M_ALLOC` on the granted-away slot ⇒ `status=1` (ErrBadCPtr) — and no faults.
-2. **Next step = crash-only domain supervision** (the Roadmap item after portal IPC; the
-   "reliability story"): kill a misbehaving/faulting ring-3 domain, **revoke its caps**
-   (epoch bump — verified I2), reclaim its task slot + frozen kernel stack + any endpoint it
-   was parked on, and restart it; clients hold their own checkpoint caps. Today a ring-3
-   `#GP`/`#PF` is fatal (halts the kernel) — change those handlers to terminate just the
-   offending task. Watch: a destroyed task that was `EpState::SendWait/RecvWait` must be
-   cleared from `ENDPOINTS[oid]` so a partner doesn't wake a dead task.
-   - **Optional 4c IPC polish first** (smaller, see `docs/PORTAL_IPC.md` "Deferred to 4c"):
-     blocking `N_WAIT` (block/wake + `NWAITER[oid]`, wake from `notify_signal`); multi-waiter
-     endpoint queues; directed hand-off on unblock; re-anchor a long-blocked task's stale EDF
-     deadline. The block/wake primitive (`sched::block_current`/`unblock`) is built and proven.
-3. **cap-core stays byte-unchanged** (its 4 Kani proofs are the regression gate; re-run via
-   `kani-proofs.sh`). git HEAD at handoff = the portal-IPC-4b commit `cffbc81` (run
-   `git log --oneline -8`); 4a per-domain/Notification `9bd7246` precedes it.
+   — expect `crash-only: admitted faulter …`, the faulter's `M_ALLOC`, then `domain 4 (task 1)
+   terminated: #UD rip=0x420025 — crash-only: kernel survives`, FOLLOWED BY the full 4b endpoint
+   rendezvous (`ep: domain2 E_RECV resumed … recv_cptr=3`, MOVE proof `cptr=1 => status=1`) and
+   the `perdomain:`/`notify:`/`GRANT_CAP gate` lines — **no panic/halt** anywhere.
+2. **Two good next steps (pick by appetite):**
+   - **Finish crash-only → restart/self-healing (4c, smaller):** re-admit a fresh instance of a
+     terminated domain (fresh CapTable + re-granted caps, reusing the freed task slot), with a
+     restart-count cap so a crash-loop is reaped. The slot+machinery are ready
+     (`terminate_current` frees the slot; `admit_user` re-fills). Also close the documented v0
+     gaps in `docs/CRASH_ONLY.md`: the one-directional endpoint scrub (a survivor parked waiting
+     for a dead task blocks forever — needs peer-tracking/timeouts), and per-domain frame
+     reclamation on death (the faulter's `M_ALLOC`'d frame leaks). Plus optional IPC 4c polish:
+     blocking `N_WAIT`, multi-waiter endpoint queues (see `docs/PORTAL_IPC.md`).
+   - **Phase 3 — zero-kernel I/O + object store (the Roadmap's major next):** PCIe enum,
+     virtio-blk/net, direct queue mapping, a log-structured object store + extent caps; objects
+     survive reboot. Big; greenfield (good Claude×Grok split).
+3. **cap-core stays byte-unchanged** (the regression gate; `git diff HEAD -- crates/` must be
+   empty). NOTE: `kani-proofs.sh` currently HANGS on the frame-alloc proofs (a prior session left
+   stale `cbmc` running — kill any `cbmc`/`cargo-kani`/`kani-driver` by NAME first, `pkill -9
+   cbmc`, NOT `-f` which self-matches). cap-core's 4 proofs already pass; to re-confirm run only
+   `cargo kani -p cap-core --features kani`. git HEAD at handoff = crash-only commit `b5362c3`
+   (run `git log --oneline -10`).
+
+## Status (Phase 2: crash-only domain supervision) ✅
+- ✅ **A ring-3 fault terminates just that domain; the kernel + other domains live on**
+  (commit `b5362c3`; `docs/CRASH_ONLY.md`). DESIGN.md pillar 8. Implemented directly (it
+  extends the 4b block/wake machinery) + put through a 4-dimension adversarial review (2
+  findings fixed; the terminate/GS asm drew ZERO).
+  - `interrupts.rs`: `faulted_in_ring3` (`code_segment.rpl()==Ring3`) routes ring-3
+    `#PF`/`#GP`/`#UD` to `terminate_ring3`; ring-0 faults stay FATAL.
+  - `sched.rs::terminate_current`: frees the slot (`num--`), `capspace::reap_domain`, picks the
+    earliest-deadline peer, and `jump_to_task`s in — NEVER returning to the fault. `jump_to_task`
+    = the restore HALF of `block_and_switch` (mov rsp; pop15; iretq) with **NO swapgs** (a ring-3
+    exception is already at GS=user(0); every target expects user(0)). `MAX_TASKS` 4→5.
+  - `capspace.rs::reap_domain`: revokes the dead domain's authority (clears its CapTable; shared
+    objects persist for other holders) + scrubs `ENDPOINTS[oid]` where the dead task was the
+    parked peer. `MAX_DOMAINS` 4→5.
+  - **Verified in QEMU:** a faulter domain `M_ALLOC`s then `ud2` → `domain 4 terminated: #UD …
+    kernel survives`, then the full 4b endpoint rendezvous completes — fault isolated, no halt.
+  - **Review fixes:** HIGH — the kernel-stack-overflow guard check now gates on `!USER_MODE` so a
+    ring-3 task reading the guard VA can't masquerade as an overflow and halt the kernel (DoS).
+    MED (documented v0 gap) — the endpoint scrub is one-directional (a survivor parked *waiting
+    for* a dead task blocks forever; needs peer-tracking/timeouts/restart → 4c).
+  - **Deferred (4c):** restart/self-healing (slot+machinery ready), per-domain frame reclamation
+    on death (the faulter's frame leaks), survivor-liveness scrub. cap-core byte-unchanged.
 
 ## Status (Phase 2: blocking endpoint IPC + scheduler block/wake — step 4b) ✅
 - ✅ **Synchronous Endpoint IPC across two ring-3 domains, with block/wake + cap-transfer**
@@ -229,8 +256,9 @@ APIC timer ✅ → preemptive round-robin scheduler ✅ → EDF policy + time-ca
 ring 3 + syscall + first userspace cap_invoke ✅ → ring-3 hardening (M_FREE gate) ✅ →
 per-domain CapTables + Notification async IPC ✅ (step 4a) → portal IPC endpoints (sync
 rendezvous) + scheduler block/wake + cap-transfer + 2nd ring-3 task ✅ (step 4b) →
-**crash-only domain supervision — NEXT** (optional 4c IPC polish first: N_WAIT/multi-waiter,
-see docs/PORTAL_IPC.md) → Phase 3 (zero-kernel I/O + object store) →
+crash-only domain supervision (ring-3 fault terminates the domain, not the kernel) ✅ →
+**4c crash-only restart/self-healing + IPC polish (small) OR Phase 3 zero-kernel I/O +
+object store (major) — NEXT** →
 Ring-3 follow-ups (deferred, see commit): fair co-scheduling (round-robin on equal EDF
 deadlines — currently lowest-index wins, so a co-scheduled shorter-period task starves the
 user task; demo runs the ring-3 task solo), return a Memory CPtr not a raw frame number to
