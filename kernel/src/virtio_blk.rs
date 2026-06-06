@@ -51,7 +51,8 @@ const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 
 // --- virtio-blk request types ---
-const VIRTIO_BLK_T_IN: u32 = 0;
+const VIRTIO_BLK_T_IN: u32 = 0; // read (device writes the data buffer)
+const VIRTIO_BLK_T_OUT: u32 = 1; // write (device reads the data buffer)
 const SECTOR: u64 = 512;
 
 /// Clamp the queue to keep desc/avail/used each within a single 4 KiB frame
@@ -292,85 +293,109 @@ pub fn init(hhdm: u64) -> bool {
     true
 }
 
+/// Submit one block request (header + the shared 512B data buffer + status), notify the
+/// device, and poll for completion. `req_type` is VIRTIO_BLK_T_IN/OUT; for a READ the data
+/// descriptor is device-written (WRITE flag), for a WRITE the device reads it. Returns true
+/// iff the device reported status OK. The caller fills `v.data` before an OUT and copies it
+/// out after an IN.
+///
+/// SAFETY: single-CPU, IRQs off; sole accessor of the queue. Device-facing addresses are
+/// raw guest-physical; ring/buffer memory is touched via its HHDM alias.
+unsafe fn submit(req_type: u32, lba: u64) -> bool {
+    let v = &mut *core::ptr::addr_of_mut!(VBLK);
+    if !v.present {
+        return false;
+    }
+    let data_dev_writes = req_type == VIRTIO_BLK_T_IN;
+
+    // Request header: type, reserved=0, sector=lba.
+    w32(v.hdr, req_type);
+    w32(v.hdr + 4, 0);
+    w64(v.hdr + 8, lba);
+    w8(v.status, 0xFF); // device overwrites with 0 = OK
+
+    // 3-descriptor chain: hdr (device reads) -> data -> status (device writes). The data
+    // descriptor's WRITE flag means "device writes it" — set only for a READ.
+    let d = v.desc;
+    w64(d, v.hdr_phys);
+    w32(d + 8, 16);
+    w16(d + 12, VIRTQ_DESC_F_NEXT);
+    w16(d + 14, 1);
+    let data_flags = VIRTQ_DESC_F_NEXT | if data_dev_writes { VIRTQ_DESC_F_WRITE } else { 0 };
+    w64(d + 16, v.data_phys);
+    w32(d + 16 + 8, SECTOR as u32);
+    w16(d + 16 + 12, data_flags);
+    w16(d + 16 + 14, 2);
+    w64(d + 32, v.status_phys);
+    w32(d + 32 + 8, 1);
+    w16(d + 32 + 12, VIRTQ_DESC_F_WRITE);
+    w16(d + 32 + 14, 0);
+
+    // Avail ring: publish head descriptor 0 at the current idx, then bump idx. Slot uses the
+    // DEVICE-negotiated queue size (v.qsize), not the QSIZE clamp.
+    let avail_idx = r16(v.avail + 2);
+    let slot = avail_idx % v.qsize;
+    w16(v.avail + 4 + (slot as u64) * 2, 0);
+    compiler_fence(Ordering::SeqCst);
+    // used.idx must reach this exact count when OUR (sole in-flight) request completes — a
+    // precise target, so a late completion after a timeout can't be mis-consumed.
+    let target = avail_idx.wrapping_add(1);
+    w16(v.avail + 2, target);
+    compiler_fence(Ordering::SeqCst);
+
+    // Notify (doorbell): notify_base + notify_off * notify_mul.
+    let notify_addr = v.notify_base + (v.notify_off as u64) * (v.notify_mul as u64);
+    w16(notify_addr, 0);
+
+    // Poll for completion, bounded. On timeout the request is still in flight, so DISABLE
+    // the device — a later read must not break instantly on the stale completion.
+    let mut guard: u64 = 0;
+    loop {
+        compiler_fence(Ordering::SeqCst);
+        if r16(v.used + 2) == target {
+            break;
+        }
+        guard += 1;
+        if guard > 50_000_000 {
+            v.present = false;
+            crate::serial_println!("virtio-blk: LBA {} TIMED OUT — device disabled", lba);
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+
+    let st = r8(v.status);
+    if st != 0 {
+        crate::serial_println!("virtio-blk: LBA {} status={:#x} (not OK)", lba, st);
+        return false;
+    }
+    true
+}
+
 /// Read one 512-byte sector at `lba` into `dst`. Polled. Returns true on success.
 pub fn read_sector(lba: u64, dst: &mut [u8; 512]) -> bool {
-    // SAFETY: single-CPU, IRQs off; sole accessor of the queue. Device-facing addresses
-    // are raw guest-physical; ring/buffer memory is touched via its HHDM alias.
+    // SAFETY: single-CPU, IRQs off; sole queue accessor.
+    unsafe {
+        if !submit(VIRTIO_BLK_T_IN, lba) {
+            return false;
+        }
+        let v = &*core::ptr::addr_of!(VBLK);
+        core::ptr::copy_nonoverlapping(v.data as *const u8, dst.as_mut_ptr(), 512);
+        true
+    }
+}
+
+/// Write one 512-byte sector `src` to `lba`. Polled. Returns true on success.
+pub fn write_sector(lba: u64, src: &[u8; 512]) -> bool {
+    // SAFETY: single-CPU, IRQs off; sole queue accessor.
     unsafe {
         let v = &mut *core::ptr::addr_of_mut!(VBLK);
         if !v.present {
             return false;
         }
-
-        // Request header: type=IN, reserved=0, sector=lba.
-        w32(v.hdr, VIRTIO_BLK_T_IN);
-        w32(v.hdr + 4, 0);
-        w64(v.hdr + 8, lba);
-        w8(v.status, 0xFF); // device overwrites with 0 = OK
-
-        // 3-descriptor chain: hdr (device reads) -> data (device writes) -> status (writes).
-        let d = v.desc;
-        // desc[0]
-        w64(d, v.hdr_phys);
-        w32(d + 8, 16);
-        w16(d + 12, VIRTQ_DESC_F_NEXT);
-        w16(d + 14, 1);
-        // desc[1]
-        w64(d + 16, v.data_phys);
-        w32(d + 16 + 8, SECTOR as u32);
-        w16(d + 16 + 12, VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE);
-        w16(d + 16 + 14, 2);
-        // desc[2]
-        w64(d + 32, v.status_phys);
-        w32(d + 32 + 8, 1);
-        w16(d + 32 + 12, VIRTQ_DESC_F_WRITE);
-        w16(d + 32 + 14, 0);
-
-        // Avail ring: publish head descriptor 0 at the current idx, then bump idx.
-        // Slot uses the DEVICE-negotiated queue size (v.qsize), not the QSIZE clamp — a
-        // device advertising a smaller queue would otherwise index past its ring.
-        let avail_idx = r16(v.avail + 2); // virtq_avail.idx
-        let slot = avail_idx % v.qsize;
-        w16(v.avail + 4 + (slot as u64) * 2, 0); // ring[slot] = head desc index 0
-        compiler_fence(Ordering::SeqCst);
-        // The device's used.idx must reach this exact count when OUR (sole in-flight)
-        // request completes — a precise target, not "!= last_used", so a late completion
-        // after a timeout can never be mis-consumed as a fresh read's result.
-        let target = avail_idx.wrapping_add(1);
-        w16(v.avail + 2, target);
-        compiler_fence(Ordering::SeqCst);
-
-        // Notify the device (doorbell): notify_base + notify_off * notify_mul.
-        let notify_addr = v.notify_base + (v.notify_off as u64) * (v.notify_mul as u64);
-        w16(notify_addr, 0); // queue index 0
-
-        // Poll virtq_used.idx (offset 2) until our request completes, bounded anti-hang.
-        // On timeout the request is still in flight, so DISABLE the device — a subsequent
-        // read must not break instantly on the stale completion and return wrong data.
-        let mut guard: u64 = 0;
-        loop {
-            compiler_fence(Ordering::SeqCst);
-            if r16(v.used + 2) == target {
-                break;
-            }
-            guard += 1;
-            if guard > 50_000_000 {
-                v.present = false;
-                crate::serial_println!("virtio-blk: read LBA {} TIMED OUT — device disabled", lba);
-                return false;
-            }
-            core::hint::spin_loop();
-        }
-
-        let st = r8(v.status);
-        if st != 0 {
-            crate::serial_println!("virtio-blk: read LBA {} status={:#x} (not OK)", lba, st);
-            return false;
-        }
-
-        // Copy the device-written data out via the HHDM alias.
-        core::ptr::copy_nonoverlapping(v.data as *const u8, dst.as_mut_ptr(), 512);
-        true
+        // Stage the data into the device-facing buffer, then submit an OUT.
+        core::ptr::copy_nonoverlapping(src.as_ptr(), v.data as *mut u8, 512);
+        submit(VIRTIO_BLK_T_OUT, lba)
     }
 }
 
@@ -393,4 +418,14 @@ pub fn smoke_test(hhdm: u64) {
         crate::serial_print!("{}", c as char);
     }
     crate::serial_println!("\" match={}", ok);
+
+    // INC3: write/read round-trip on LBA 8 (away from the magic sector) — the L2 block
+    // primitive the Cairnlog store rides on.
+    let mut wbuf = [0u8; 512];
+    for (i, b) in wbuf.iter_mut().enumerate() {
+        *b = (i as u8) ^ 0xA5;
+    }
+    let mut rbuf = [0u8; 512];
+    let rt = write_sector(8, &wbuf) && read_sector(8, &mut rbuf) && wbuf == rbuf;
+    crate::serial_println!("virtio-blk: wrote+read LBA8 512B match={}", rt);
 }
