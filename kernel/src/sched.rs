@@ -39,6 +39,10 @@ struct Task {
     // diagnostics
     activations: u64,
     deadline_misses: u64,
+    // Kernel-stack top for this task: where a syscall / privilege-changing interrupt
+    // from ring 3 lands (TSS.rsp0 + PerCpu.kernel_rsp0). For a ring-0 task this is
+    // also where it runs; for a ring-3 task its run stack is a separate user stack.
+    kstack_top: u64,
 }
 
 impl Task {
@@ -52,6 +56,7 @@ impl Task {
         budget_ns: 0,
         activations: 0,
         deadline_misses: 0,
+        kstack_top: 0,
     };
 }
 
@@ -85,6 +90,7 @@ pub fn init() {
             present: true,
             runnable: true,
             abs_deadline_ns: u64::MAX,
+            kstack_top: crate::stack_top(), // boot thread runs on the main kernel stack
             ..Task::EMPTY
         };
         s.num = 1;
@@ -100,23 +106,43 @@ pub fn init() {
 ///
 /// SAFETY: caller holds exclusive access (IRQs off, single CPU) and `i` is a free
 /// slot in `1..MAX_TASKS`.
-unsafe fn build_task_frame(i: usize, entry: extern "C" fn() -> !) -> u64 {
-    let (code_sel, data_sel) = crate::gdt::kernel_selectors();
-    let base = core::ptr::addr_of_mut!(TASK_STACKS[i]) as usize as u64;
-    let top = (base + TASK_STACK_SIZE as u64) & !0xf;
+unsafe fn build_task_frame_inner(
+    i: usize,
+    entry_va: u64,
+    user: bool,
+    user_rsp: u64,
+    initial_rdi: u64,
+) -> u64 {
+    let (cs, ss) = if user {
+        crate::gdt::user_selectors() // ring 3 (0x23, 0x1b)
+    } else {
+        crate::gdt::kernel_selectors() // ring 0 (0x08, 0x10)
+    };
+    let top = task_kstack_top(i);
     let frame_ptr = top - 20 * 8;
     let f = frame_ptr as *mut u64;
     for k in 0..15 {
         f.add(k).write(0);
     }
-    f.add(15).write(entry as usize as u64); // RIP
-    f.add(16).write(code_sel as u64); // CS
+    f.add(9).write(initial_rdi); // RDI at entry (Memory cptr for ring-3 tasks; 0 else)
+    f.add(15).write(entry_va); // RIP
+    f.add(16).write(cs as u64); // CS (RPL 3 => iretq returns to ring 3)
     f.add(17).write(0x202); // RFLAGS: IF=1 (preemptible) + reserved bit
-    // RSP = top-8 so the entry fn begins with RSP%16==8, as the SysV ABI requires
-    // (iretq pushes no return address, unlike a `call`, so we must pre-offset by 8).
-    f.add(18).write(top - 8);
-    f.add(19).write(data_sel as u64); // SS
+    // RSP-8 so the entry begins with RSP%16==8 (SysV; iretq pushes no return addr).
+    f.add(18).write(if user { user_rsp - 8 } else { top - 8 });
+    f.add(19).write(ss as u64); // SS
     frame_ptr
+}
+
+/// Ring-0 task frame (runs on its own kernel stack). Delegates to the shared builder
+/// so the 20-u64 layout is byte-identical for ring-0 and ring-3 tasks.
+unsafe fn build_task_frame(i: usize, entry: extern "C" fn() -> !) -> u64 {
+    build_task_frame_inner(i, entry as usize as u64, false, 0, 0)
+}
+
+/// 16-aligned top of task `i`'s kernel stack (its rsp0 + ring-0 run stack).
+unsafe fn task_kstack_top(i: usize) -> u64 {
+    (core::ptr::addr_of_mut!(TASK_STACKS[i]) as usize as u64 + TASK_STACK_SIZE as u64) & !0xf
 }
 
 /// Find a free task slot in `1..MAX_TASKS`. SAFETY: caller holds exclusive access.
@@ -163,6 +189,52 @@ pub fn admit(
             budget_ns,
             activations: 0,
             deadline_misses: 0,
+            kstack_top: task_kstack_top(i),
+        };
+        s.num += 1;
+        Some(i)
+    }
+}
+
+/// Admit a **ring-3 (userspace)** periodic task. Same TimeSlice-capability gate as
+/// [`admit`], but the task runs at CPL 3: it starts at `user_entry_va` on its own
+/// `user_stack_top`, with the Memory capability `mem_cptr` placed in RDI so its first
+/// instruction can `cap_invoke` it. Its kernel stack (`TASK_STACKS[i]`) is used only
+/// for the iretq frame, syscalls, and preempting interrupts (TSS.rsp0).
+#[allow(clippy::too_many_arguments)]
+pub fn admit_user(
+    user_entry_va: u64,
+    user_stack_top: u64,
+    mem_cptr: u16,
+    cptr: u16,
+    period_ns: u64,
+    rel_deadline_ns: u64,
+    budget_ns: u64,
+) -> Option<usize> {
+    if period_ns == 0 {
+        return None;
+    }
+    if crate::capspace::admit_check(cptr) != cap_core::table::Status::Ok {
+        return None;
+    }
+    // SAFETY: single-CPU, interrupts off during setup; the ring-3 frame uses the same
+    // verified 20-u64 layout (user CS/SS + user RSP), published once complete.
+    unsafe {
+        let s = &mut *core::ptr::addr_of_mut!(SCHED);
+        let i = free_slot(s)?;
+        let frame_ptr = build_task_frame_inner(i, user_entry_va, true, user_stack_top, mem_cptr as u64);
+        let now = now_ns();
+        s.tasks[i] = Task {
+            rsp: frame_ptr,
+            present: true,
+            runnable: true,
+            period_ns,
+            rel_deadline_ns,
+            abs_deadline_ns: now.saturating_add(rel_deadline_ns),
+            budget_ns,
+            activations: 0,
+            deadline_misses: 0,
+            kstack_top: task_kstack_top(i),
         };
         s.num += 1;
         Some(i)
@@ -181,6 +253,7 @@ extern "C" fn schedule_tick(current_rsp: u64) -> u64 {
 
         let s = &mut *core::ptr::addr_of_mut!(SCHED);
         if s.num <= 1 {
+            set_kernel_stack(s.tasks[s.current].kstack_top); // defensive (no ring-3 task yet)
             return current_rsp; // nothing else to run; resume the same task
         }
         let now = now_ns();
@@ -192,8 +265,20 @@ extern "C" fn schedule_tick(current_rsp: u64) -> u64 {
         roll_deadlines(s, now);
         let n = pick_next(s);
         s.current = n;
+        // Point TSS.rsp0 + PerCpu.kernel_rsp0 at the incoming task's kernel stack so a
+        // syscall or privilege-changing interrupt from it lands on ITS stack (never a
+        // stale/other task's). Load-bearing for ring-3 correctness.
+        set_kernel_stack(s.tasks[n].kstack_top);
         s.tasks[n].rsp
     }
+}
+
+/// Update both kernel-stack-top references used on a ring3→ring0 entry.
+/// SAFETY: single-CPU, interrupts off (called only from schedule_tick).
+#[inline]
+unsafe fn set_kernel_stack(ktop: u64) {
+    crate::gdt::set_rsp0(ktop);
+    core::ptr::addr_of_mut!(crate::syscall::PER_CPU.kernel_rsp0).write(ktop);
 }
 
 /// Naked APIC-timer ISR: save the full register context, switch stacks via

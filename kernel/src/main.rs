@@ -24,6 +24,8 @@ mod paging;
 mod capspace;
 mod sched;
 mod serial;
+mod syscall;
+mod user;
 
 use limine::request::{HhdmRequest, MemmapRequest, StackSizeRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
@@ -72,6 +74,13 @@ pub fn stack_guard_base() -> u64 {
     // SAFETY: addr_of! only takes the address of the static's field — it neither
     // reads nor writes it — and the address is stable for the kernel's lifetime.
     unsafe { core::ptr::addr_of!(KERNEL_STACK._guard) as u64 }
+}
+
+/// Top (16-aligned) of the boot thread's guarded kernel stack — task 0's rsp0 and
+/// the rsp0 used for a ring-3→ring-0 entry while the boot thread is current.
+pub fn stack_top() -> u64 {
+    // SAFETY: addr_of! only takes the field address; stable for the kernel's life.
+    unsafe { (core::ptr::addr_of!(KERNEL_STACK.usable) as u64 + KSTACK_USABLE as u64) & !0xf }
 }
 
 /// Limine base revision marker (must be present).
@@ -182,6 +191,9 @@ unsafe extern "C" fn kmain_main() -> ! {
         serial_println!("stack guard: WARNING could not unmap guard page {:#x}", guard);
     }
 
+    // Arm syscall/sysret + ring-3 entry (needs the GDT's user segments; before sti).
+    syscall::init();
+
     if let Some(mm) = memmap_resp {
         memory::init(hhdm_offset, mm);
     } else {
@@ -226,44 +238,40 @@ unsafe extern "C" fn kmain_main() -> ! {
         None => serial_println!("init_root failed"),
     }
 
-    // --- Phase 2: preemptive multitasking off the APIC timer ---
-    // Register the boot thread as task 0, spawn two demo kernel tasks, start the
-    // periodic timer, and enable interrupts. The naked timer ISR round-robins the
-    // tasks on every tick (round-robin now; EDF policy next). Each demo task prints
-    // once per time it is resumed, so interleaved output proves real preemption.
+    // --- Phase 2: EDF over BOTH ring-0 and ring-3 tasks, off the APIC timer ---
+    // Mint a Memory capability the ring-3 task will invoke; map its user code+stack;
+    // admit one kernel (ring-0) task and one userspace (ring-3) task — both gated by a
+    // TimeSlice capability ("time is a capability"). The ring-3 task issues real
+    // `syscall`s that reach verified cap-core through the syscall path.
     if apic::init_timer(hhdm_offset) {
         sched::init();
-        // "Time is a capability" (DESIGN.md pillar 6): each periodic task is admitted
-        // to the EDF run queue ONLY by presenting a live TimeSlice capability, validated
-        // through verified cap-core. Coprime periods (2/5/13 ms) so the EDF schedule
-        // can't trivially alias a round-robin one; under EDF the shorter-period task
-        // gets proportionally more CPU (~1/T), which round-robin would split evenly.
-        let demo: [(&str, extern "C" fn() -> !, u64); 3] = [
-            ("fast", task_fast, 2_000_000),
-            ("med", task_med, 5_000_000),
-            ("slow", task_slow, 13_000_000),
-        ];
-        let mut admitted = 0u32;
-        for (name, entry, period) in demo {
-            match capspace::mint_timeslice() {
-                Some(cptr) => match sched::admit(entry, cptr, period, period, period / 4) {
-                    Some(i) => {
-                        admitted += 1;
-                        serial_println!(
-                            "EDF: admitted {} (T={}ms) as task {} via TimeSlice cptr={}",
-                            name,
-                            period / 1_000_000,
-                            i,
-                            cptr
-                        );
-                    }
-                    None => serial_println!("EDF: admit({}) failed (table full / bad cap)", name),
-                },
-                None => serial_println!("EDF: mint_timeslice failed for {}", name),
+
+        // Memory cap for the ring-3 task to cap_invoke(M_ALLOC).
+        let mem_cptr = capspace::init_root();
+
+        // Admit ONE ring-3 (userspace) EDF task that makes real cap_invoke syscalls.
+        // (Run solo besides idle so it isn't starved — the current EDF tie-break favors
+        // the lowest index, so a co-scheduled shorter-period ring-0 task would crowd it
+        // out. Fair co-scheduling = a later scheduler refinement.)
+        match (mem_cptr, capspace::mint_timeslice(), user::setup_user_demo(hhdm_offset)) {
+            (Some(mc), Some(tc), Some((entry, ustack))) => {
+                match sched::admit_user(entry, ustack, mc, tc, 5_000_000, 5_000_000, 1_000_000) {
+                    Some(i) => serial_println!(
+                        "EDF: admitted ring-3 user task (T=5ms) as task {}; entry={:#x} mem_cptr={}",
+                        i, entry, mc
+                    ),
+                    None => serial_println!("EDF: admit_user failed"),
+                }
             }
+            (mc, _, us) => serial_println!(
+                "ring3: setup incomplete (mem_cptr={} user_demo={}) — skipping user task",
+                mc.is_some(),
+                us.is_some()
+            ),
         }
-        // Capability gate + live O(1) revocation (verified invariant I2): a TimeSlice
-        // cap that has been revoked is denied admission.
+
+        // Capability gate + live O(1) revocation (verified I2): a revoked TimeSlice
+        // cap is denied admission.
         if let Some(c) = capspace::mint_timeslice() {
             let _ = capspace::revoke_timeslice(c);
             serial_println!(
@@ -271,58 +279,16 @@ unsafe extern "C" fn kmain_main() -> ! {
                 capspace::admit_check(c)
             );
         }
-        serial_println!(
-            "scheduler: idle=task0 + {} periodic tasks; enabling EDF preemption",
-            admitted
-        );
+
+        serial_println!("scheduler: enabling EDF preemption (ring-3 user task)");
         x86_64::instructions::interrupts::enable(); // sti
     } else {
         serial_println!("timer unavailable — no preemption");
     }
 
-    // Boot thread (task 0) is the idle task; EDF runs fast/med/slow by deadline.
+    // Boot thread (task 0) is the idle task; EDF runs the ring-3 user task, which
+    // issues real cap_invoke syscalls (proof prints from syscall_dispatch).
     hcf();
-}
-
-/// EDF demo tasks: busy loops that count the ticks they are scheduled for (the
-/// global tick advanced while running) and print throttled. Under EDF the counts
-/// diverge by period (fast >> med >> slow) — round-robin would keep them ~equal.
-extern "C" fn task_fast() -> ! {
-    demo_task("fast")
-}
-
-extern "C" fn task_med() -> ! {
-    demo_task("med")
-}
-
-extern "C" fn task_slow() -> ! {
-    demo_task("slow")
-}
-
-fn demo_task(name: &str) -> ! {
-    use core::sync::atomic::Ordering;
-    let mut last_tick = 0u64;
-    let mut runs = 0u64; // ticks this task was scheduled (its CPU share)
-    let mut next_report_ms = 0u64;
-    loop {
-        let t = apic::TICKS.load(Ordering::Relaxed);
-        if t != last_tick {
-            last_tick = t;
-            runs += 1;
-            // Time-throttled report (~once / 2 s of guest time) so all three tasks
-            // print at a comparable rate despite very different CPU shares.
-            if t >= next_report_ms {
-                next_report_ms = t + 2000;
-                serial_println!(
-                    "[{}] {} of {} ms scheduled (~{}% cpu)",
-                    name,
-                    runs,
-                    t,
-                    runs.saturating_mul(100) / t.max(1)
-                );
-            }
-        }
-    }
 }
 
 #[panic_handler]

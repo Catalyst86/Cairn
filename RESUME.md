@@ -4,6 +4,34 @@
 Cairn is a from-scratch, capability-based OS for James's HPE ProLiant x86-64 server,
 built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\Desktop\Cairn`.
 
+## ⏭ Next session — start here
+1. **Confirm the clean boot** still works: `wsl.exe -d Ubuntu -- bash /mnt/c/WSL/cairn-go-kernel.sh`
+   — expect `ring3 syscall #1..#8: cap_invoke(...) => Ok frame=0x...` and no faults.
+2. **Fold in the ring-3 adversarial review.** A review workflow (`ring3-review`, run id
+   `wviq512f3`) was IN FLIGHT at session end. If its result file still exists, read
+   `…/tasks/wviq512f3.output`; otherwise just re-run a review (`/code-review` or a fresh
+   review workflow) over the ring-3 diff. Its findings are expected to be the latent
+   hardening items already in the Roadmap (SMEP/SMAP off, raw-frame leak, M_FREE ownership,
+   sysret canonical-RIP guard, IF-during-syscall, NMI paranoid-entry, fair co-scheduling).
+   Fix any HIGH/confirmed ones; the rest are documented deferrals.
+3. **Cosmetic:** the build is warning-clean except the new nightly `function_casts_as_integer`
+   lint on `fn as usize` (interrupts.rs:47, syscall.rs:72/100, user.rs:66) — rewrite as
+   `fn as *const () as usize`. Pre-existing dead-code note on `Task` derive is benign.
+4. **Then build forward:** portal IPC (endpoints + notify caps) + per-domain CapTables (see Roadmap).
+   git HEAD at handoff = the ring-3 commit (run `git log --oneline -8`).
+
+## Status (Phase 2: ring-3 userspace making real cap_invoke syscalls)
+- ✅ **`syscall`/`sysret` + ring 3 + first userspace `cap_invoke`.** `syscall.rs` arms the
+  MSRs (STAR/LSTAR/SFMASK/KERNEL_GS_BASE + EFER.SCE|NXE) and holds the naked `syscall_entry`
+  stub (swapgs → per-task kernel-stack switch → CAP_ABI↔SysV marshal → `syscall_dispatch` →
+  `cap_invoke` → anti-leak zero → `sysretq`). `gdt.rs` reordered for STAR (kCS 0x08, kSS 0x10,
+  uDS 0x18, uCS 0x20, TSS 0x28) with a **mutable TSS** whose `rsp0` the scheduler rewrites per
+  switch. `sched.rs` gained `admit_user` + ring-3 frames (`build_task_frame_inner`) + per-switch
+  `set_kernel_stack`. `paging.rs::map_user_page` maps W^X USER pages; `user.rs` is the ring-3
+  blob. **Verified in QEMU:** a CPL-3 task issued **8 real `cap_invoke(M_ALLOC)` syscalls**
+  (distinct frames 0x109000…0x110000), each a full ring3→syscall→cap-core→sysret round-trip; a
+  revoked TimeSlice cap is still denied admission. Grok built `map_user_page` + `user.rs`; Claude
+  built the GDT/MSR/asm/scheduler integration. cap-core byte-unchanged.
 ## Status (Phase 2: EDF scheduler with time-capabilities running)
 - ✅ **EDF scheduler + time-capabilities (DESIGN.md pillar 6).** `sched.rs` now selects
   the earliest-deadline runnable task (`pick_next`) off **calibrated real-time deadlines**;
@@ -143,8 +171,14 @@ backstop. Building keystone's own page tables is now OPTIONAL polish, not a bloc
 
 ## Roadmap (Phase 2 underway)
 APIC timer ✅ → preemptive round-robin scheduler ✅ → EDF policy + time-caps ✅ →
-**`syscall`/`sysret` + ring 3 + first userspace domain doing a real cap_invoke — NEXT**
-→ portal IPC → Phase 3 (zero-kernel I/O + object store) →
+ring 3 + syscall + first userspace cap_invoke ✅ → **portal IPC (endpoints + notify caps)
++ per-domain CapTables — NEXT** → crash-only domain supervision → Phase 3 (zero-kernel I/O +
+object store) →
+Ring-3 follow-ups (deferred, see commit): fair co-scheduling (round-robin on equal EDF
+deadlines — currently lowest-index wins, so a co-scheduled shorter-period task starves the
+user task; demo runs the ring-3 task solo), return a Memory CPtr not a raw frame number to
+ring 3, M_FREE arg-ownership check, sysret canonical-RIP guard once user RIP is attacker-
+influenced, re-enable IF mid-syscall for blocking IPC, NMI paranoid-entry + SMEP/SMAP.
 Follow-ups deferred from EDF: per-task budget *enforcement* (preempt on overrun; v0 only
 accounts), deadline-miss policy beyond finish-late, calibration accuracy on real HW,
 admission utilization check (Σ Cᵢ/Tᵢ≤1), and a way to revoke an *already-admitted* task's

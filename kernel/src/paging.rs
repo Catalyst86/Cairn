@@ -209,3 +209,40 @@ pub fn map_one_page(hhdm_offset: u64, addr: u64) -> bool {
     }
     false
 }
+
+/// Map one 4 KiB page `virt` -> a fresh zeroed frame, USER-accessible (ring 3), with
+/// W^X-friendly flags: `writable` adds WRITABLE; `exec=false` adds NO_EXECUTE. Returns
+/// the backing frame number. Intermediate tables are created USER too (the U/S bit is
+/// AND-ed down the walk, so leaf-only USER would still #PF in ring 3).
+///
+/// SAFETY: single-CPU early boot, interrupts off; `virt` is a fresh low-half user VA
+/// not already mapped.
+pub fn map_user_page(hhdm: u64, virt: u64, writable: bool, exec: bool) -> Option<u64> {
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt & !0xfff));
+    let fnum = crate::memory::allocate_frame()?;
+    let frame = PhysFrame::containing_address(PhysAddr::new(fnum * 4096));
+    let mut mapper = unsafe { active_mapper(hhdm) };
+    let mut frames = KernelFrames;
+    let mut leaf = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if writable {
+        leaf |= PageTableFlags::WRITABLE;
+    }
+    if !exec {
+        leaf |= PageTableFlags::NO_EXECUTE;
+    }
+    // CRITICAL: parents must also be USER (and PRESENT|WRITABLE) or the walk denies ring 3.
+    let parent =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    // SAFETY: mapping a fresh user page; we flush, then zero via the kernel HHDM alias of
+    // the frame (the user VA may be read-only / no-write from this side).
+    unsafe {
+        mapper
+            .map_to_with_table_flags(page, frame, leaf, parent, &mut frames)
+            .ok()?
+            .flush();
+        core::ptr::write_bytes((hhdm + fnum * 4096) as *mut u8, 0, 4096);
+    }
+    // W^X invariant: never simultaneously writable and executable.
+    debug_assert!(!(writable && exec));
+    Some(fnum)
+}
