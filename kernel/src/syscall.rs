@@ -19,11 +19,14 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use cap_core::table::Status;
 
 /// Per-CPU block reached via `gs:` after `swapgs`. Field offsets are load-bearing
-/// for the asm stub: `kernel_rsp0` @ 0, `user_rsp_scratch` @ 8.
+/// for the asm stub: `kernel_rsp0` @ 0, `user_rsp_scratch` @ 8, `reply_cptr` @ 16.
 #[repr(C)]
 pub struct PerCpu {
     pub kernel_rsp0: u64,
     pub user_rsp_scratch: u64,
+    /// IPC reply CPtr (a transferred capability's destination slot, or `CPTR_NULL` if
+    /// none), written by `syscall_dispatch` and read by the entry stub's epilogue into rdx.
+    pub reply_cptr: u64,
 }
 
 /// Single-CPU: one per-CPU block. `kernel_rsp0` is kept equal to the current
@@ -31,6 +34,7 @@ pub struct PerCpu {
 pub static mut PER_CPU: PerCpu = PerCpu {
     kernel_rsp0: 0,
     user_rsp_scratch: 0,
+    reply_cptr: 0,
 };
 
 /// The only syscall number in v0 (no ambient authority: everything is cap_invoke).
@@ -128,8 +132,8 @@ pub unsafe extern "C" fn syscall_entry() {
         "call {dispatch}", // -> SyscallRet { status: rax, reply: rdx }
         "add rsp, 8",      // pop the 7th-arg slot
         // Pack outputs (CAP_ABI: rax=status, rsi=reply, rdx=reply_cptr).
-        "mov rsi, rdx", // reply -> rsi
-        "xor edx, edx", // reply_cptr = 0 (no cap transfer in v0)
+        "mov rsi, rdx",               // reply -> rsi
+        "mov rdx, qword ptr gs:[16]", // reply_cptr (PerCpu.reply_cptr) -> rdx; kernel GS still active
         // Restore user context for sysret.
         "pop rcx",  // user RIP    -> RCX
         "pop r11",  // user RFLAGS -> R11 (restores IF=1)
@@ -165,31 +169,45 @@ pub extern "C" fn syscall_dispatch(
     _arg2: u64,
     xfer: u64,
 ) -> SyscallRet {
+    // Anti-leak default: no transferred cap (CPTR_NULL sentinel, not slot 0). The IPC
+    // path overwrites this just before returning (staged per-task across a block, never
+    // relying on PER_CPU across yields).
+    // SAFETY: single-CPU, IRQs off; direct static write (not gs-relative).
+    unsafe {
+        core::ptr::addr_of_mut!(PER_CPU.reply_cptr).write(CPTR_NULL);
+    }
+
     if nr != SYS_CAP_INVOKE {
         return SyscallRet { status: Status::ErrMethod as u64, reply: 0 };
     }
-    if cptr > u16::MAX as u64 || method > u16::MAX as u64 {
+    if cptr > u16::MAX as u64 || method > u16::MAX as u64 || xfer > u16::MAX as u64 {
         return SyscallRet { status: Status::ErrBadCPtr as u64, reply: 0 };
     }
-    // v0: capability transfer over syscall is not implemented yet; require null.
-    if xfer != CPTR_NULL && xfer != 0 {
-        return SyscallRet { status: Status::ErrMethod as u64, reply: 0 };
+
+    // The xfer slot is honored only for Endpoint targets (capspace enforces this and
+    // rejects a stray xfer on any other object). Capability transfer + blocking
+    // rendezvous live in cap_invoke_ipc, which returns (status, reply, reply_cptr).
+    let (st, reply, reply_cptr) =
+        crate::capspace::cap_invoke_ipc(cptr as u16, method as u16, arg0, xfer as u16);
+
+    // SAFETY: single-CPU, IRQs off; direct static write read back by the epilogue.
+    unsafe {
+        core::ptr::addr_of_mut!(PER_CPU.reply_cptr).write(reply_cptr as u64);
     }
 
-    let (st, reply) = crate::capspace::cap_invoke(cptr as u16, method as u16, arg0);
-
-    // Proof print (throttled): a ring-3 task reached verified cap-core via syscall.
+    // Proof print (throttled): a ring-3 task reached the cap path via syscall.
     let n = SYSCALL_REPORTS.fetch_add(1, Ordering::Relaxed);
-    if n < 8 {
+    if n < 12 {
         crate::serial_println!(
-            "ring3 syscall #{}: cap_invoke(cptr={}, method={}) => {:?} frame={:#x}",
+            "ring3 syscall #{}: cap_invoke(cptr={}, method={}) => status={} reply={:#x} rcptr={}",
             n + 1,
             cptr,
             method,
             st,
-            reply * 4096
+            reply,
+            reply_cptr
         );
     }
 
-    SyscallRet { status: st as u64, reply }
+    SyscallRet { status: st, reply }
 }

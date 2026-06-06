@@ -42,24 +42,49 @@ switch, so a ring-3 `syscall` resolves its CPtr against its own table automatica
   ring-3 `M_ALLOC` via its delegated cap, and a Notification signalled by one domain +
   polled by another with rights enforced (signal-only cap cannot poll).
 
-## Increment 4b — NEXT: Endpoints (sync rendezvous) + block/wake + 2nd ring-3 task
-- **Scheduler block/wake primitive:** `block_current(reason)` (mark not-runnable,
-  yield) + `unblock(task)` (mark runnable). The hard part; single-CPU, IRQs-off, must
-  cooperate with EDF `pick_next`/`roll_deadlines` and never lose a wakeup.
-- **Notification blocking wait** (`N_WAIT`): block until pending≠0, then return+clear.
-  One waiter/object in v0 (record waiter task id beside `NOTIFY`).
-- **Endpoint** (kind 5): `E_SEND`/`E_RECV` synchronous rendezvous. Sender blocks until
-  a receiver is waiting (and vice-versa); transfer up to N scalar words. Optional
-  **capability transfer**: move the cap in the syscall `xfer` slot (currently stubbed
-  in `syscall_dispatch`) from sender→receiver domain table iff the endpoint cap has
-  `GRANT_CAP`. This is where the `xfer != CPTR_NULL` branch gets implemented.
-- **Two ring-3 tasks** (client + server) over one endpoint → the first real IPC demo.
-- Good Claude×Grok split: Grok drafts the rendezvous state machine; Claude integrates
-  the block/wake into EDF, wires cap-transfer, reviews unsafe, drives verify.
-- Add Kani harnesses for the new wiring where it has model-checkable logic.
+## Increment 4b — DONE: Endpoints (sync rendezvous) + block/wake + 2nd ring-3 task
+Designed via a judged 4-way design panel (run `wke6z5oxd`), then implemented and put
+through a 5-dimension adversarial review (run `w3fa74g69`).
 
-## Deferred (carry-overs, unchanged)
-Return a Memory **CPtr** (not a raw frame) from `M_ALLOC` so `M_FREE` can be
-ownership-checked (until then `M_FREE` is refused — see capspace). Multi-waiter
-endpoints/notifications; fair co-scheduling on equal EDF deadlines; SMP (per-CPU run
-queues + real locks — today's cap tables assume single-CPU/IRQs-off).
+- **Scheduler block/wake (`sched.rs`):** `block_current(reason, oid)` parks the running
+  task *inside its syscall* and switches to the earliest-deadline peer; `unblock(task,
+  status, reply, reply_cptr)` stages the IPC result then clears `blocked`. The one new
+  naked routine `block_and_switch` saves the blocked task as the **exact same 20-u64
+  frame** `timer_isr`/`build_task_frame_inner` use (resumable by EITHER the timer OR a
+  peer's switch via one identical pop+iretq tail), resuming at a kernel `resume_point`
+  with kernel CS/SS and IF=0. **GS-neutral**: a paired `swapgs` (out before the switch,
+  in at `resume_point`) keeps active GS = what every incoming task expects (this fixed a
+  fatal flaw the panel found in a competing design). `Task` gains an INDEPENDENT
+  `blocked` gate (pick_next skips it; roll_deadlines won't re-arm it) + per-task IPC
+  staging. Lost-wakeup-free by IF=0-for-the-whole-syscall atomicity + deliver-before-
+  unblock ordering.
+- **Endpoint** (kind 5, `capspace.rs`): `E_SEND`/`E_RECV` single-waiter rendezvous
+  (fast handoff if the partner is parked, else block). State in `ENDPOINTS[oid]` (mirrors
+  `NOTIFY`). One scalar message word + optional **capability transfer** via the syscall
+  `xfer` slot, gated on `GRANT_CAP` (channel) AND `DELEGATE` (the moved cap). Transfer =
+  verified `delegate(all)` + clear source slot (MOVE), and is **atomic with the
+  rendezvous** — a failed grant aborts both parties with the error, never reports Ok.
+  `reply_cptr` flows back in rdx via `PER_CPU.reply_cptr@16`. cap-core byte-unchanged.
+- **Two ring-3 tasks** (`user.rs`/`main.rs`): client (domain 1) sends `0xCA11` + grants a
+  Memory cap; server (domain 2) blocks on recv, resumes with the message + moved cap, and
+  `M_ALLOC`s via it. Boot-log proofs: server parks → client rendezvous → server resumes
+  (`recv_cptr=3`) → moved cap works in domain 2 → client's granted-away slot ⇒ ErrBadCPtr
+  (MOVE) → GRANT_CAP-less send ⇒ ErrRights. No faults.
+- **Review fixes folded in:** `do_cap_transfer` now returns `Result` and the rendezvous
+  aborts atomically on a failed grant (was: silently Ok); the single `CPTR_NULL` (0xffff)
+  sentinel replaces the ambiguous `0` for both `xfer` and `reply_cptr` (slot 0 is now an
+  ordinary transferable slot); `xfer` is range-checked before parking.
+
+## Deferred to 4c (and later)
+- **Blocking `N_WAIT`** on Notifications (the block/wake primitive trivially extends to
+  it via an `NWAITER[oid]` slot + waking from `notify_signal`).
+- Multi-waiter endpoints/notifications (FIFO sender/receiver queues); v0 returns
+  `ErrRights` to a second waiter in a direction.
+- A cap-core `move` primitive (GRANT without requiring DELEGATE on the moved cap).
+- Directed hand-off on unblock (switch straight to a woken earlier-deadline partner);
+  re-anchor a long-blocked task's stale EDF deadline at unblock (fairness).
+- Bulk payloads beyond one scalar word (via shared Memory caps).
+- Return a Memory **CPtr** (not a raw frame) from `M_ALLOC` so `M_FREE` can be
+  ownership-checked (until then `M_FREE` is refused). SMP (per-CPU run queues + real
+  locks — today's cap/sched state assumes single-CPU/IRQs-off). Re-enabling IF mid-syscall
+  (would replace the IF=0 atomicity argument with a real critical section).

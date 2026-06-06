@@ -47,6 +47,20 @@ struct Task {
     // runs in its own domain so its CPtrs resolve against its own table; ring-0/idle
     // use domain 0 (root). The scheduler publishes this to capspace on each switch.
     domain: u16,
+    // --- block/wake for portal IPC (4b) ---
+    // `blocked` is an INDEPENDENT gate from `runnable`: roll_deadlines re-arms
+    // `runnable` every period, so a task parked inside a blocking syscall must be kept
+    // off the run queue by `blocked` until its rendezvous partner wakes it. pick_next
+    // skips blocked tasks; roll_deadlines will not re-arm a blocked task's `runnable`.
+    blocked: bool,
+    block_reason: u8, // diagnostic: why parked (BLOCK_RECV / BLOCK_SEND)
+    wait_ep: u16,     // diagnostic: object id being waited on
+    // IPC result staged by the waker BEFORE it clears `blocked` (deliver-before-unblock,
+    // so the result is visible before pick_next can ever select the woken task). Read by
+    // the resumed syscall to return to ring 3; `ipc_reply_cptr` is a transferred CPtr.
+    ipc_status: u64,
+    ipc_reply: u64,
+    ipc_reply_cptr: u16,
 }
 
 impl Task {
@@ -62,6 +76,12 @@ impl Task {
         deadline_misses: 0,
         kstack_top: 0,
         domain: 0,
+        blocked: false,
+        block_reason: 0,
+        wait_ep: 0,
+        ipc_status: 0,
+        ipc_reply: 0,
+        ipc_reply_cptr: 0,
     };
 }
 
@@ -196,6 +216,7 @@ pub fn admit(
             deadline_misses: 0,
             kstack_top: task_kstack_top(i),
             domain: 0, // ring-0 kernel task runs in the root domain
+            ..Task::EMPTY
         };
         s.num += 1;
         Some(i)
@@ -243,6 +264,7 @@ pub fn admit_user(
             deadline_misses: 0,
             kstack_top: task_kstack_top(i),
             domain,
+            ..Task::EMPTY
         };
         s.num += 1;
         Some(i)
@@ -345,6 +367,136 @@ pub unsafe extern "C" fn timer_isr() {
     )
 }
 
+// ---------------- block / wake (portal IPC 4b) ----------------
+//
+// A task can BLOCK *inside a syscall* (endpoint rendezvous with no partner) and later
+// RESUME to finish the syscall and `sysret`. The mechanism (vetted by an adversarial
+// design panel) is "twin-frame": a blocked task is saved as the SAME 20-u64 frame the
+// timer ISR uses, so it is indistinguishable to the restore path from a preempted
+// ring-0 task and is resumable by EITHER the timer OR a peer's block switch with one
+// identical pop+iretq tail. There are now THREE producers of that frame layout that
+// MUST stay in sync: `build_task_frame_inner`, `timer_isr`'s save, and
+// `block_and_switch` below (f[0]=r15 .. f[14]=rax, f[15..20]=RIP/CS/RFLAGS/RSP/SS).
+
+/// Block reasons (diagnostic only).
+pub const BLOCK_RECV: u8 = 1;
+pub const BLOCK_SEND: u8 = 2;
+
+/// The one new naked routine. Save the caller's context as a standard 20-u64 frame
+/// (resumes at `resume_point`, kernel CS/SS, IF=0), store the saved-context pointer
+/// through `save_slot` (rdi), then switch to `next_rsp` (rsi) via the proven
+/// pop+iretq tail. Entered mid-syscall with IF=0 and kernel GS active.
+///
+/// GS-NEUTRAL: a `swapgs` BEFORE the switch sets active GS to user(0) — matching every
+/// frame the restore tail can land on (ring-3=0, idle=0, blocked-resume re-swaps) — and
+/// a `swapgs` at `resume_point` re-establishes kernel GS. Two swapgs per block/resume
+/// (even), so per-syscall swapgs parity stays at the proven entry+exit pair.
+///
+/// SAFETY: called only from `block_current` with IRQs off, single CPU, kernel GS active,
+/// and no live Rust `&mut` aliasing the saved-context slot.
+#[unsafe(naked)]
+unsafe extern "C" fn block_and_switch(save_slot: *mut u64, next_rsp: u64) {
+    naked_asm!(
+        // rdi = save_slot, rsi = next_rsp (both preserved through the pushes below).
+        "mov rax, rsp", // R0: points at our return address (the resume `ret` pops it)
+        // iretq tail of the saved frame (high addresses): kernel SS/CS, IF=0, RIP=resume.
+        "push 0x10",            // SS  = kernel data
+        "push rax",             // RSP = R0
+        "push 0x2",             // RFLAGS (IF=0, reserved bit set)
+        "push 0x8",             // CS  = kernel code
+        "lea rax, [rip + 2f]",
+        "push rax",             // RIP = resume_point
+        // 15 GP regs in timer_isr order (rax pushed first/highest .. r15 last/lowest).
+        // rbx/rbp/r12-r15 carry block_current's live locals; caller-saved slots are dead.
+        "push rax", "push rbx", "push rcx", "push rdx", "push rsi", "push rdi",
+        "push rbp", "push r8", "push r9", "push r10", "push r11", "push r12",
+        "push r13", "push r14", "push r15",
+        "mov [rdi], rsp", // *save_slot = saved-context pointer (rdi never modified above)
+        "swapgs",         // GS-neutral: active GS -> user(0) before switching away
+        "mov rsp, rsi",   // switch to the next task's saved context (rsi never modified)
+        // Restore tail (own copy; byte-identical to timer_isr's).
+        "pop r15", "pop r14", "pop r13", "pop r12", "pop r11", "pop r10", "pop r9",
+        "pop r8", "pop rbp", "pop rdi", "pop rsi", "pop rdx", "pop rcx", "pop rbx",
+        "pop rax",
+        "iretq",
+        "2:",     // resume_point: reached via iretq from a later restore; GS=user(0), IF=0
+        "swapgs", // GS-neutral: re-establish kernel GS for the resuming syscall
+        "ret",    // pop return address (rsp = R0) -> back into block_current
+    )
+}
+
+/// Park the current (running) task and switch to the earliest-deadline runnable peer
+/// (idle floor guarantees a choice). Returns ONLY after a waker has staged this task's
+/// IPC result, cleared `blocked`, and the scheduler later resumes it. MUST be called
+/// with interrupts disabled (mid-syscall, IF=0) and with NO cap-table / endpoint lock
+/// held (the woken partner re-locks them).
+pub fn block_current(reason: u8, ep_oid: u16) {
+    debug_assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "block_current requires IF=0 (the lost-wakeup/two-source proof depends on it)"
+    );
+    let sched = core::ptr::addr_of_mut!(SCHED);
+    // SAFETY: single-CPU, IRQs off; raw-pointer access only, with NO long-lived `&mut`
+    // held across the asm switch (the asm writes the saved-ctx ptr through `save_slot`).
+    unsafe {
+        let cur = (*sched).current;
+        (*sched).tasks[cur].blocked = true;
+        (*sched).tasks[cur].block_reason = reason;
+        (*sched).tasks[cur].wait_ep = ep_oid;
+
+        let now = now_ns();
+        roll_deadlines(&mut *sched, now);
+        let n = pick_next(&*sched);
+        (*sched).current = n;
+        let ktop = (*sched).tasks[n].kstack_top;
+        set_kernel_stack(ktop);
+        crate::capspace::set_current_domain((*sched).tasks[n].domain);
+
+        let next = (*sched).tasks[n].rsp;
+        debug_assert!(next != 0, "resuming a task with no saved context");
+        let save_slot = core::ptr::addr_of_mut!((*sched).tasks[cur].rsp);
+        // No Rust reference is live across this call (all reads above were via raw ptr).
+        block_and_switch(save_slot, next);
+        // ON RESUME: control returns here. `blocked` was cleared by the waker and our
+        // ipc_* fields hold the rendezvous result (read via take_ipc_result by the caller).
+    }
+}
+
+/// Wake `task`: stage its IPC result, THEN clear `blocked` (deliver-before-unblock — the
+/// result is published before pick_next can ever select the woken task). Does not switch;
+/// EDF picks the woken task on a later tick. MUST be called with IRQs off.
+pub fn unblock(task: usize, status: u64, reply: u64, reply_cptr: u16) {
+    if task >= MAX_TASKS {
+        return;
+    }
+    let sched = core::ptr::addr_of_mut!(SCHED);
+    // SAFETY: single-CPU, IRQs off; raw scalar writes. Result-before-runnable ordering.
+    unsafe {
+        (*sched).tasks[task].ipc_status = status;
+        (*sched).tasks[task].ipc_reply = reply;
+        (*sched).tasks[task].ipc_reply_cptr = reply_cptr;
+        (*sched).tasks[task].blocked = false;
+    }
+}
+
+/// Index of the running task (its protection domain == its capspace table).
+pub fn current_task() -> usize {
+    // SAFETY: single-CPU, IRQs off when called from the syscall path; scalar read.
+    unsafe { (*core::ptr::addr_of!(SCHED)).current }
+}
+
+/// Read the IPC result staged for task `i` by its waker (status, reply, reply_cptr).
+pub fn take_ipc_result(i: usize) -> (u64, u64, u16) {
+    if i >= MAX_TASKS {
+        return (0, 0, 0);
+    }
+    // SAFETY: single-CPU, IRQs off; scalar reads.
+    unsafe {
+        let t = &(*core::ptr::addr_of!(SCHED)).tasks[i];
+        (t.ipc_status, t.ipc_reply, t.ipc_reply_cptr)
+    }
+}
+
 /// Current time in nanoseconds, derived from the single clock source (apic::TICKS).
 #[inline]
 fn now_ns() -> u64 {
@@ -367,7 +519,12 @@ fn roll_deadlines(s: &mut Scheduler, now: u64) {
             // deadline release_k + D), independent of D — so always advance by period_ns.
             // (Advancing by max(D,T) over-spaces deadlines when D > T.)
             t.abs_deadline_ns = t.abs_deadline_ns.saturating_add(t.period_ns);
-            t.runnable = true;
+            // Do NOT re-arm a task parked in a blocking syscall: its `runnable` must stay
+            // gated by `blocked` until its IPC partner wakes it (else a periodic re-arm
+            // would resurrect a mid-rendezvous task). Deadline/activations still advance.
+            if !t.blocked {
+                t.runnable = true;
+            }
         }
     }
 }
@@ -382,7 +539,7 @@ fn pick_next(s: &Scheduler) -> usize {
     let mut found_real = false;
     for i in 1..MAX_TASKS {
         let t = &s.tasks[i];
-        if !t.present || !t.runnable {
+        if !t.present || !t.runnable || t.blocked {
             continue;
         }
         // Any present+runnable real task beats idle — even one whose deadline has

@@ -1,88 +1,121 @@
-//! Ring-3 user-mode demo blob and page setup for the early cap-invoke smoke test.
+//! Ring-3 user-mode demo blobs + page setup for the portal-IPC (4b) smoke test.
 //!
-//! Provides a tiny position-independent ring-3 program (via global_asm) that
-//! exercises the cap_invoke ABI a bounded number of times, plus the helper that
-//! maps its code and stack pages with appropriate USER|W^X flags and copies the
-//! blob in.
+//! Two tiny position-independent ring-3 programs exercise the Endpoint IPC ABI across
+//! two protection domains:
+//!   - `client_main` (domain 1): `E_SEND` a message word AND grant (transfer) a Memory
+//!     capability over the endpoint, then try to use the granted-away cap (now gone).
+//!   - `server_main` (domain 2): `E_RECV` the message + the moved cap, then `M_ALLOC`
+//!     via the received cap to prove it works in its domain; loops back to `E_RECV`
+//!     (which then blocks forever — no more senders).
 //!
-//! Claude wires the returned (entry, stack_top) into the initial task context
-//! and performs the first cap_invoke to grant the Memory cap; this module only
-//! prepares the address space.
+//! Both blobs are PIC (immediates + `syscall` + relative `jmp` only) so they can be
+//! copied to fixed user VAs. CPtr slots are by *delegation order* in `main.rs`:
+//! each domain's endpoint cap is delegated first (slot 0, passed in RDI), and the
+//! client's grantable Memory cap second (slot 1).
 
 use crate::paging::map_user_page;
 
-// The ring-3 demo blob. Compiled position-independent; copied (not executed)
-// from the kernel image into a user-mapped executable page.
+// The two ring-3 blobs. Compiled position-independent; copied (not executed) from the
+// kernel image into user-mapped executable pages. See module docs for the cptr layout.
 core::arch::global_asm!(
-    ".global user_main",
+    // ---- client (domain 1): send msg + grant a Memory cap, then touch the moved slot ----
+    ".global client_main",
     ".p2align 4",
-    "user_main:",
-    "    mov rbx, rdi",          // save Memory cptr (callee-saved, survives syscalls)
-    "    mov r12, 8",            // bounded number of ALLOC calls
-    "1:",
-    "    test r12, r12",
-    "    jz 2f",
-    "    dec r12",
-    "    mov rax, 1",            // SYS_CAP_INVOKE
-    "    mov rdi, rbx",          // cptr = Memory cap
-    "    mov rsi, 1",            // method = M_ALLOC
-    "    xor edx, edx",          // arg0 = 0
-    "    xor r10d, r10d",        // arg1
-    "    xor r8d, r8d",          // arg2
-    "    mov r9, 0xffff",        // transfer = CPTR_NULL
+    "client_main:",
+    "    mov rbx, rdi",        // rbx = endpoint cptr (slot 0, passed in RDI)
+    "    mov rax, 1",          // SYS_CAP_INVOKE
+    "    mov rdi, rbx",        // cptr = endpoint
+    "    mov rsi, 1",          // method = E_SEND
+    "    mov rdx, 0xCA11",     // arg0 = message word
+    "    xor r10d, r10d",
+    "    xor r8d, r8d",
+    "    mov r9, 1",           // transfer cptr = grantable Memory cap (slot 1)
     "    syscall",
+    "    mov rax, 1",          // now prove MOVE: the granted-away slot 1 no longer resolves
+    "    mov rdi, 1",
+    "    mov rsi, 1",          // method = M_ALLOC (expect ErrBadCPtr)
+    "    xor edx, edx",
+    "    xor r10d, r10d",
+    "    xor r8d, r8d",
+    "    mov r9, 0xffff",      // transfer = CPTR_NULL
+    "    syscall",
+    "1:",
     "    jmp 1b",
+    ".global client_main_end",
+    "client_main_end:",
+    // ---- server (domain 2): recv msg + moved cap, alloc via it, then recv again ----
+    ".global server_main",
+    ".p2align 4",
+    "server_main:",
+    "    mov rbx, rdi",        // rbx = endpoint cptr (slot 0)
     "2:",
-    "    jmp 2b",
-    ".global user_main_end",
-    "user_main_end:",
+    "    mov rax, 1",          // SYS_CAP_INVOKE
+    "    mov rdi, rbx",        // cptr = endpoint
+    "    mov rsi, 2",          // method = E_RECV (blocks until a sender arrives)
+    "    xor edx, edx",
+    "    xor r10d, r10d",
+    "    xor r8d, r8d",
+    "    mov r9, 0xffff",      // transfer = CPTR_NULL
+    "    syscall",
+    "    mov r12, rdx",        // r12 = received cptr (the moved Memory cap, or 0)
+    "    mov rax, 1",
+    "    mov rdi, r12",        // cptr = received cap
+    "    mov rsi, 1",          // method = M_ALLOC (prove the moved cap works in domain 2)
+    "    xor edx, edx",
+    "    xor r10d, r10d",
+    "    xor r8d, r8d",
+    "    mov r9, 0xffff",
+    "    syscall",
+    "    jmp 2b",              // loop: next E_RECV blocks forever (no more senders)
+    ".global server_main_end",
+    "server_main_end:",
 );
 
 extern "C" {
-    /// The ring-3 blob (defined in global_asm). Its ADDRESS in the kernel image is the
-    /// source we copy from; it is NOT called directly.
-    pub fn user_main();
-    /// End label used only to compute the exact byte length of the blob for the copy.
-    pub fn user_main_end();
+    pub fn client_main();
+    pub fn client_main_end();
+    pub fn server_main();
+    pub fn server_main_end();
 }
 
-/// Map a read-only executable user code page at 0x400000 and a writable NX user
-/// stack page at 0x7ff000, copy the demo blob into the code page via its HHDM
-/// alias, and return the entry VA and initial user stack top.
+/// Map a read-only executable user code page at `code_va` and a writable NX user stack
+/// page at `stack_va`, copy the PIC `blob` (whose end is `blob_end`) into the code page
+/// via its HHDM alias, and return `(entry_va, stack_top)` where `stack_top = stack_va +
+/// 4096`. The caller places these into the ring-3 task's initial context (RIP/RSP) with
+/// the endpoint cptr in RDI.
 ///
-/// The caller (main) will place the returned values into the initial ring-3
-/// context (RIP=entry, RSP=stack_top) along with a Memory capability in RDI.
-///
-/// SAFETY: single-CPU, interrupts disabled, early boot; the VAs are known-fresh
-/// and not present in the Limine tables. We map via HHDM for the zero and copy
-/// because the user VAs may have W or X restrictions from the kernel side.
-pub fn setup_user_demo(hhdm: u64) -> Option<(u64, u64)> {
-    // Code page: USER | PRESENT | (no WRITABLE) | (EXEC allowed, i.e. no NO_EXECUTE)
-    let code_fnum = map_user_page(hhdm, 0x40_0000, /*writable=*/ false, /*exec=*/ true)?;
+/// SAFETY: single-CPU, interrupts off, early boot; `code_va`/`stack_va` are fresh user
+/// VAs not already mapped, and the blob fits in one page.
+pub fn setup_user_task(
+    hhdm: u64,
+    code_va: u64,
+    stack_va: u64,
+    blob: unsafe extern "C" fn(),
+    blob_end: unsafe extern "C" fn(),
+) -> Option<(u64, u64)> {
+    // Code page: USER | PRESENT | (no WRITABLE) | (EXEC allowed) — W^X.
+    let code_fnum = map_user_page(hhdm, code_va, /*writable=*/ false, /*exec=*/ true)?;
+    // Stack page: USER | PRESENT | WRITABLE | NO_EXECUTE.
+    let _stack_fnum = map_user_page(hhdm, stack_va, /*writable=*/ true, /*exec=*/ false)?;
 
-    // Stack page: USER | PRESENT | WRITABLE | NO_EXECUTE
-    let _stack_fnum = map_user_page(hhdm, 0x7f_f000, /*writable=*/ true, /*exec=*/ false)?;
+    let len = (blob_end as *const () as usize) - (blob as *const () as usize);
 
-    let len = (user_main_end as *const () as usize) - (user_main as *const () as usize);
-
-    // SAFETY: we are writing into the freshly allocated frame that backs the
-    // user code page. We use the kernel HHDM alias (writable from our CPL0 view)
-    // rather than the user VA 0x400000 (which we mapped read-only for W^X).
-    // The source is a static from global_asm in our own image; len is exact
-    // from the end label. Single-CPU, no concurrent accessors, TLB not yet
-    // holding any user translation for this VA.
+    // SAFETY: copy the PIC blob into the freshly allocated code frame via the kernel HHDM
+    // alias (the user VA is mapped read-only). `len` is exact from the end label; the
+    // source is a static from global_asm in our own image; single-CPU, no concurrent
+    // accessors, no user TLB entry for this VA yet.
     unsafe {
         core::ptr::copy_nonoverlapping(
-            user_main as *const u8,
+            blob as *const () as *const u8,
             (hhdm + code_fnum * 4096) as *mut u8,
             len,
         );
     }
 
     crate::serial_println!(
-        "user: mapped code @0x400000 (U,X,RO) stack @0x800000 (U,W,NX), blob {} bytes",
-        len
+        "user: mapped code @{:#x} (U,X,RO) stack @{:#x} (U,W,NX), blob {} bytes",
+        code_va, stack_va, len
     );
 
-    Some((0x40_0000, 0x80_0000))
+    Some((code_va, stack_va + 0x1000))
 }

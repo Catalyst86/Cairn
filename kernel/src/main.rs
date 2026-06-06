@@ -283,44 +283,75 @@ unsafe extern "C" fn kmain_main() -> ! {
         }
     }
 
-    // --- Phase 2: EDF over BOTH ring-0 and ring-3 tasks, off the APIC timer ---
-    // Mint a Memory capability the ring-3 task will invoke; map its user code+stack;
-    // admit one kernel (ring-0) task and one userspace (ring-3) task — both gated by a
-    // TimeSlice capability ("time is a capability"). The ring-3 task issues real
-    // `syscall`s that reach verified cap-core through the syscall path.
+    // --- Phase 2 step 4b: blocking client/server Endpoint IPC across two domains ---
+    // Two ring-3 tasks share one endpoint: the server (domain 2) E_RECVs and BLOCKS;
+    // the client (domain 1) E_SENDs a message AND grants (transfers) a Memory cap; the
+    // rendezvous wakes the server, which receives the message + moved cap and uses it.
+    // Both are gated by a TimeSlice cap ("time is a capability"). cap-core unchanged.
     if apic::init_timer(hhdm_offset) {
         sched::init();
 
-        // Memory cap for the ring-3 task: mint in root, then DELEGATE an INVOKE-only
-        // copy into the task's OWN domain (1). The task runs in domain 1, so its
-        // syscalls resolve this CPtr against its own per-domain table (first live use
-        // of the verified `delegate`). mem_cptr is therefore domain-1-relative.
-        const USER_DOMAIN: usize = 1;
-        let mem_cptr = capspace::init_root().and_then(|root_mem| {
-            capspace::delegate_from_root(USER_DOMAIN, root_mem, Rights::INVOKE, 0)
-        });
+        const CLIENT_DOMAIN: usize = 1;
+        const SERVER_DOMAIN: usize = 2;
 
-        // Admit ONE ring-3 (userspace) EDF task that makes real cap_invoke syscalls.
-        // (Run solo besides idle so it isn't starved — the current EDF tie-break favors
-        // the lowest index, so a co-scheduled shorter-period ring-0 task would crowd it
-        // out. Fair co-scheduling = a later scheduler refinement.)
-        match (mem_cptr, capspace::mint_timeslice(), user::setup_user_demo(hhdm_offset)) {
-            (Some(mc), Some(tc), Some((entry, ustack))) => {
-                match sched::admit_user(
-                    entry, ustack, mc, tc, USER_DOMAIN as u16, 5_000_000, 5_000_000, 1_000_000,
-                ) {
-                    Some(i) => serial_println!(
-                        "EDF: admitted ring-3 user task (T=5ms) as task {} in domain {}; entry={:#x} mem_cptr={}",
-                        i, USER_DOMAIN, entry, mc
-                    ),
-                    None => serial_println!("EDF: admit_user failed"),
+        // Shared endpoint. Delegate the endpoint cap FIRST into each domain (→ slot 0,
+        // passed in RDI): client gets INVOKE|GRANT_CAP (may transfer caps), server INVOKE.
+        let ep = capspace::create_endpoint();
+        let ep_client =
+            ep.and_then(|e| capspace::delegate_from_root(CLIENT_DOMAIN, e, Rights::INVOKE | Rights::GRANT_CAP, 0));
+        let ep_server =
+            ep.and_then(|e| capspace::delegate_from_root(SERVER_DOMAIN, e, Rights::INVOKE, 0));
+        // The Memory cap the client will GRANT to the server (needs DELEGATE to be MOVEd).
+        // Delegated SECOND into the client domain → slot 1 (the client blob grants slot 1).
+        let client_mem = capspace::init_root()
+            .and_then(|m| capspace::delegate_from_root(CLIENT_DOMAIN, m, Rights::INVOKE | Rights::DELEGATE, 0));
+
+        let server_blob = user::setup_user_task(
+            hhdm_offset, 0x41_0000, 0x7e_f000, user::server_main, user::server_main_end,
+        );
+        let client_blob = user::setup_user_task(
+            hhdm_offset, 0x40_0000, 0x7f_f000, user::client_main, user::client_main_end,
+        );
+
+        // Admit SERVER first (lower task index → runs first → parks on E_RECV), then
+        // CLIENT. Each needs its own TimeSlice cap. The endpoint cptr goes in RDI.
+        match (ep_server, ep_client, client_mem, server_blob, client_blob) {
+            (Some(eps), Some(epc), Some(cm), Some((se, ss)), Some((ce, cs))) => {
+                match (capspace::mint_timeslice(), capspace::mint_timeslice()) {
+                    (Some(t1), Some(t2)) => {
+                        let s = sched::admit_user(
+                            se, ss, eps, t1, SERVER_DOMAIN as u16, 5_000_000, 5_000_000, 1_000_000,
+                        );
+                        let c = sched::admit_user(
+                            ce, cs, epc, t2, CLIENT_DOMAIN as u16, 5_000_000, 5_000_000, 1_000_000,
+                        );
+                        serial_println!(
+                            "EDF: admitted server(domain{})={:?} ep_cptr={}; client(domain{})={:?} ep_cptr={} grant_mem_cptr={}",
+                            SERVER_DOMAIN, s, eps, CLIENT_DOMAIN, c, epc, cm
+                        );
+                    }
+                    _ => serial_println!("ipc demo: TimeSlice mint failed"),
                 }
             }
-            (mc, _, us) => serial_println!(
-                "ring3: setup incomplete (mem_cptr={} user_demo={}) — skipping user task",
-                mc.is_some(),
-                us.is_some()
+            _ => serial_println!(
+                "ipc demo: setup incomplete (ep_server={} ep_client={} client_mem={} server_blob={} client_blob={})",
+                ep_server.is_some(), ep_client.is_some(), client_mem.is_some(),
+                server_blob.is_some(), client_blob.is_some()
             ),
+        }
+
+        // Negative proof (synchronous, returns before any park): an endpoint cap WITHOUT
+        // GRANT_CAP cannot transfer a cap — E_SEND with a non-null xfer => ErrRights (4).
+        if let Some(ep2) = capspace::create_endpoint() {
+            if let Some(ep2_d3) = capspace::delegate_from_root(3, ep2, Rights::INVOKE, 0) {
+                capspace::set_current_domain(3);
+                let (st, _, _) = capspace::cap_invoke_ipc(ep2_d3, capspace::E_SEND, 0xBEEF, 5);
+                capspace::set_current_domain(0);
+                serial_println!(
+                    "ep: GRANT_CAP gate — E_SEND w/ xfer but no GRANT_CAP => status={} (expect 4=ErrRights)",
+                    st
+                );
+            }
         }
 
         // Capability gate + live O(1) revocation (verified I2): a revoked TimeSlice
@@ -333,14 +364,14 @@ unsafe extern "C" fn kmain_main() -> ! {
             );
         }
 
-        serial_println!("scheduler: enabling EDF preemption (ring-3 user task)");
+        serial_println!("scheduler: enabling EDF preemption (client+server endpoint IPC)");
         x86_64::instructions::interrupts::enable(); // sti
     } else {
         serial_println!("timer unavailable — no preemption");
     }
 
-    // Boot thread (task 0) is the idle task; EDF runs the ring-3 user task, which
-    // issues real cap_invoke syscalls (proof prints from syscall_dispatch).
+    // Boot thread (task 0) is the idle task; EDF runs the two ring-3 tasks, which
+    // rendezvous over the endpoint (proof prints from capspace + syscall_dispatch).
     hcf();
 }
 
