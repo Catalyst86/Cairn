@@ -19,6 +19,8 @@ use core::arch::asm;
 mod gdt;
 mod interrupts;
 mod memory;
+mod paging;
+mod capspace;
 mod serial;
 
 use limine::request::{HhdmRequest, MemmapRequest};
@@ -81,6 +83,7 @@ unsafe extern "C" fn kmain() -> ! {
     // virtual addresses in v0).
     let hhdm_resp = HHDM_REQUEST.response();
     let hhdm_offset = hhdm_resp.map(|r| r.offset).unwrap_or(0);
+    serial_println!("HHDM offset: {:#x}", hhdm_offset);
 
     // === CPU foundations + memory (order matters) ===
     gdt::init();
@@ -92,6 +95,10 @@ unsafe extern "C" fn kmain() -> ! {
         memory::init_hhdm(hhdm_offset);
         serial_println!("frame allocator: 0 free 4KiB frames (no memory map from Limine)");
     }
+
+    // NOTE: Limine leaves part of the kernel's NOBITS .bss tail unmapped on this
+    // setup. We map those pages on demand from the #PF handler (see interrupts.rs)
+    // now that the frame allocator is up.
 
     memory::init_heap();
 
@@ -112,6 +119,15 @@ unsafe extern "C" fn kmain() -> ! {
 
     // Report free frames from our map-derived allocator (after the heap init line).
     serial_println!("free frames: {}", memory::free_frame_count());
+
+    // --- capability self-test (wires verified cap-core into the live kernel) ---
+    // TEMPORARILY DISABLED. capspace's large static cap tables land in the part of
+    // the kernel .bss that Limine leaves unmapped, and our on-demand pager can't
+    // yet create page tables in HHDM-uncovered frames. The next focused task is
+    // proper kernel page-table setup (build our own tables instead of patching
+    // Limine's). capspace.rs + paging.rs are written, reviewed, and compile.
+    serial_println!("capspace + paging modules loaded (live cap_invoke demo pending paging rework)");
+    let _ = (capspace::M_ALLOC, capspace::M_FREE);
 
     hcf();
 }

@@ -40,10 +40,10 @@ fn check_i4_invoke_requires_right() {
 
     // Freshly minted => epoch and type match by construction.
     let s_ok = ct.invoke(&ot, cptr_with, 42, Rights::INVOKE);
-    kani::assert!(s_ok == Status::Ok, "I4: cap with INVOKE must succeed invoke check");
+    assert!(s_ok == Status::Ok, "I4: cap with INVOKE must succeed invoke check");
 
     let s_bad = ct.invoke(&ot, cptr_without, 42, Rights::INVOKE);
-    kani::assert!(
+    assert!(
         s_bad == Status::ErrRights,
         "I4: cap without INVOKE must fail with ErrRights"
     );
@@ -80,13 +80,13 @@ fn check_i2_revocation_completeness() {
     let req = Rights::from_bits_truncate(req_bits);
 
     let status = ct.invoke(&ot, cptr, method, req);
-    kani::assert!(
+    assert!(
         status == Status::ErrRevoked,
         "I2: post-revoke cap minted at old epoch must yield ErrRevoked"
     );
 
     // Sanity: the epoch really changed.
-    kani::assert!(
+    assert!(
         ot.metas[oid as usize].current_epoch != pre,
         "revoke must have advanced the epoch"
     );
@@ -125,7 +125,7 @@ fn check_i3_no_rights_amplification() {
         if let Ok(child) = dst.lookup(dst_cptr, &ot) {
             let child_bits = child.rights.bits();
             let parent_bits = parent_rights.bits();
-            kani::assert!(
+            assert!(
                 (child_bits & parent_bits) == child_bits,
                 "I3: delegated child rights must be a subset of parent rights (no amplification)"
             );
@@ -137,7 +137,7 @@ fn check_i3_no_rights_amplification() {
     let m2: u16 = kani::any();
     let mask2 = Rights::from_bits_truncate(m2);
     let child2 = parent2 & mask2;
-    kani::assert!(
+    assert!(
         (child2.bits() & parent2.bits()) == child2.bits(),
         "I3 (bitwise): (parent & mask) is always ⊆ parent"
     );
@@ -169,11 +169,11 @@ fn check_encode_decode_roundtrip() {
     let enc = cap.encode();
     let dec = CapEntry::decode(enc);
 
-    kani::assert!(
+    assert!(
         cap == dec,
         "encode/decode round-trip must preserve all fields (lossless)"
     );
 
     // Re-encoding the decoded value yields identical bits.
-    kani::assert!(enc == dec.encode(), "re-encode after decode is stable");
+    assert!(enc == dec.encode(), "re-encode after decode is stable");
 }

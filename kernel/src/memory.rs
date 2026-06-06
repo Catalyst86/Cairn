@@ -234,7 +234,10 @@ pub fn init(hhdm_offset: u64, memmap: &MemmapResponse) {
                 continue;
             }
             // Convert byte range to frame range (4 KiB). Align outward for safety.
-            let first = (entry.base + 0xfff) / 0x1000;
+            // Skip the first 1 MiB: low memory holds the IVT/BIOS/Limine
+            // structures and is not reliably covered by the HHDM — which we need
+            // in order to write page-table frames. Keep allocatable frames above it.
+            let first = core::cmp::max((entry.base + 0xfff) / 0x1000, 0x100);
             let last = (entry.base + entry.length) / 0x1000;
             if first < last {
                 fa.add_region(first, last);

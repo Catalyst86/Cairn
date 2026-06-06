@@ -71,6 +71,16 @@ extern "x86-interrupt" fn page_fault_handler(
         .map(|a| a.as_u64())
         .unwrap_or(0);
 
+    // On-demand map kernel higher-half pages that Limine left unmapped (the
+    // NOBITS .bss tail). Only for *not-present* faults inside the kernel image
+    // range; map the page and retry the faulting instruction.
+    if !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+        && (0xffff_ffff_8000_0000..0xffff_ffff_c000_0000).contains(&fault_addr)
+        && crate::paging::map_one_page(crate::memory::hhdm_offset(), fault_addr)
+    {
+        return;
+    }
+
     crate::serial_println!("EXCEPTION: PAGE FAULT");
     crate::serial_println!("  accessed address: {:#x}", fault_addr);
     crate::serial_println!("  error code: {:?}", error_code);
