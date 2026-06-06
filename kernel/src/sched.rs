@@ -556,6 +556,12 @@ pub fn terminate_current() -> ! {
         // where it was the parked peer (so no survivor wakes a dead task).
         crate::capspace::reap_domain(domain, cur as u16);
 
+        // Crash-only self-healing: the supervisor may re-admit a fresh instance of this
+        // domain (fresh caps, reusing the freed slot) under a restart budget. Runs here —
+        // after reap, before pick_next — so a restarted task is eligible immediately. No
+        // live &mut SCHED is held across this call (all reads above were via raw ptr).
+        crate::supervisor::on_domain_death(domain);
+
         // Choose the next runnable task and switch into it (idle is the floor).
         let now = now_ns();
         roll_deadlines(&mut *sched, now);

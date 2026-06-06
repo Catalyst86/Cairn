@@ -40,19 +40,34 @@ A `faulter` ring-3 task (its own domain, admitted FIRST so it dies early) does o
   the kernel survived and the fault was isolated to the one domain. No panic/halt; the
   run quiesces.
 
-## Known v0 gaps / deferred (4c / later)
+## Restart / self-healing (DONE — `supervisor.rs`)
+When `terminate_current` reaps a domain it calls `supervisor::on_domain_death(domain)`
+(after freeing the slot + `reap_domain`, before `pick_next`). For a registered restartable
+domain with budget left, the supervisor decrements the budget and **re-admits a fresh
+instance** — fresh Memory cap delegated into the (now-empty) domain table + a TimeSlice,
+via `sched::admit_user`, reusing the freed task slot (the user pages persist, so no
+re-map). When the budget is exhausted the domain stays reaped. v0 keeps a one-entry
+registry (the demo faulter, budget 2); a real supervisor would hold per-domain specs +
+backoff/escalation.
+
+Re-entrancy is sound: `terminate_current` holds only a RAW pointer to `SCHED` (raw
+`(*sched)` accesses), so `admit_user`'s transient `&mut *addr_of_mut!(SCHED)` during the
+restart does not alias a live reference; no capspace lock is held across the re-admit.
+
+Boot-log proof: faulter `#UD` → `supervisor: RESTARTED domain 4 (1 restart left)` → `#UD`
+→ `RESTARTED (0 left)` → `#UD` → `reaped — restart budget exhausted`, with the kernel +
+4b endpoint demo running throughout (3 terminations, 2 restarts, 0 faults).
+
+## Known v0 gaps / deferred (later)
 - **Survivor liveness (one-directional scrub)**: `reap_domain` clears endpoints the DEAD
   task was parked on, but a *survivor* already parked **waiting for** the dead task blocks
   forever (its slot's `peer_task` is itself, so reap can't identify it). Safety is fine (no
-  corruption) — it's a liveness gap. Proper fix needs endpoint peer-tracking / IPC timeouts
-  / domain restart. Not exercised by the current demo (the faulter is no one's IPC partner).
-- **Restart / self-healing**: re-admit a fresh instance of a terminated domain (fresh
-  CapTable + re-granted caps, reusing the freed task slot), with a restart-count policy
-  (cap restarts so a crash-loop is reaped); client checkpoint caps. The slot + machinery
-  are ready (terminate frees the slot; admit_user re-fills it).
-- **Resource accounting on death**: the faulter's `M_ALLOC`'d frame leaks on termination
-  (frames aren't tracked per-domain yet; tied to the "return a Memory CPtr" item so
-  frames can be reclaimed on reap).
-- Notification-waiter scrub (once blocking `N_WAIT` exists in 4c).
+  corruption) — a liveness gap; needs endpoint peer-tracking / IPC timeouts. Not exercised
+  by the current demo (the faulter is no one's IPC partner).
+- **Resource accounting on death**: the faulter's `M_ALLOC`'d frame (and a Memory +
+  TimeSlice object per restart) leaks on termination — BOUNDED by the restart budget here,
+  but frames aren't tracked per-domain yet (tied to the "return a Memory CPtr from M_ALLOC"
+  item so frames/objects can be reclaimed on reap).
+- Notification-waiter scrub (once blocking `N_WAIT` exists).
 - Per-task page-table teardown (v0 ring-3 tasks share one address space at distinct VAs).
 - SMP (per-CPU run queues + real locks).

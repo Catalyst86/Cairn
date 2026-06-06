@@ -24,6 +24,7 @@ mod paging;
 mod capspace;
 mod sched;
 mod serial;
+mod supervisor;
 mod syscall;
 mod user;
 
@@ -291,22 +292,27 @@ unsafe extern "C" fn kmain_main() -> ! {
     if apic::init_timer(hhdm_offset) {
         sched::init();
 
-        // --- crash-only supervision demo: a faulter domain that deliberately #UDs ---
+        // --- crash-only supervision demo: a faulter domain that #UDs, then self-heals ---
         // Admitted FIRST (lowest task index ⇒ runs first), so it M_ALLOCs then faults
-        // EARLY; the endpoint rendezvous below then completes normally — proving the
-        // kernel survived the fault and isolated it to the one domain.
-        const FAULT_DOMAIN: usize = 4;
+        // EARLY. Registered with the supervisor for RESTART: it crashes, is re-admitted
+        // (budget 2), crashes again, and is finally reaped — the kernel and the 4b
+        // endpoint demo survive throughout, proving fault isolation + self-healing.
+        let fault_domain = supervisor::FAULT_DOMAIN as usize;
         let fault_mem = capspace::init_root()
-            .and_then(|m| capspace::delegate_from_root(FAULT_DOMAIN, m, Rights::INVOKE, 0));
+            .and_then(|m| capspace::delegate_from_root(fault_domain, m, Rights::INVOKE, 0));
         let fault_blob = user::setup_user_task(
             hhdm_offset, 0x42_0000, 0x7d_f000, user::faulter_main, user::faulter_main_end,
         );
         match (fault_mem, fault_blob, capspace::mint_timeslice()) {
             (Some(fm), Some((fe, fs)), Some(ft)) => {
-                match sched::admit_user(fe, fs, fm, ft, FAULT_DOMAIN as u16, 5_000_000, 5_000_000, 1_000_000) {
+                // Register the (persistent) entry/stack for restart before first admission.
+                supervisor::register_faulter(fe, fs, 2);
+                match sched::admit_user(
+                    fe, fs, fm, ft, supervisor::FAULT_DOMAIN, 5_000_000, 5_000_000, 1_000_000,
+                ) {
                     Some(i) => serial_println!(
-                        "crash-only: admitted faulter (domain{}) as task {}; mem_cptr={} (will M_ALLOC then #UD)",
-                        FAULT_DOMAIN, i, fm
+                        "crash-only: admitted faulter (domain{}) as task {}; mem_cptr={} (M_ALLOC then #UD; restart budget=2)",
+                        fault_domain, i, fm
                     ),
                     None => serial_println!("crash-only: faulter admit failed"),
                 }
