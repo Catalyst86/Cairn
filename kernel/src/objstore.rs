@@ -1,12 +1,18 @@
-//! Cairnlog object store v0 (Phase 3, increment 4 — L3): an A/B double-buffered superblock
-//! + content hashing over the virtio-blk L2 block layer. The append log + content-addressed
-//! Extent caps arrive in INC5; "objects survive reboot" is INC6.
+//! Cairnlog object store v0 (Phase 3, increments 4+5 — L3): an A/B double-buffered superblock
+//! + content hashing over the virtio-blk L2 block layer, plus an **append-log `put`** that
+//! commits content-addressed extents (INC5). Content-addressed Extent *caps* are minted in
+//! `capspace::mint_extent` from a `put` result; "objects survive reboot" (re-mint the root
+//! Extent on mount) is INC6.
 //!
-//! Crash-consistency: the superblock flip is the single linearization point. Writing a
-//! superblock issues `virtio_blk::flush` before it is considered committed (serialized
-//! completion is ordering, not durability, under QEMU's writeback cache). On mount we read
-//! both slots, validate each by its content hash, and pick the higher VALID `seq`; a torn
-//! superblock fails its hash and we fall back to the other slot.
+//! Crash-consistency: the superblock flip is the single linearization point. `put` writes the
+//! data sectors THEN a record header (data-before-header, so a torn tail is never advertised),
+//! `flush`es, then writes the OTHER superblock slot with `seq+1` + the new root and `flush`es
+//! again — that flip is the commit. A failed write before the flip leaves the previous
+//! superblock authoritative (the half-written log bytes sit past the old `log_head` and are
+//! overwritten by the next `put`). Writing a superblock issues `virtio_blk::flush` before it
+//! is considered committed (serialized completion is ordering, not durability, under QEMU's
+//! writeback cache). On mount we read both slots, validate each by its content hash, and pick
+//! the higher VALID `seq`; a torn superblock fails its hash and we fall back to the other slot.
 
 use crate::virtio_blk;
 
@@ -28,6 +34,19 @@ const O_ROOT_LEN: usize = 40;
 const O_ROOT_HASH: usize = 48;
 const O_SB_HASH: usize = 56;
 
+// Append-log RECORD HEADER (one 512B sector written AFTER its data sectors, so a torn
+// tail is never advertised). Layout within the sector (little-endian):
+//   0 rec_magic:u64 | 8 content_len:u32 | 16 content_hash:u64 | 24 prev_lba:u64
+//   32 hdr_hash:u64 (FNV-1a of bytes [0..32])
+// `prev_lba` chains to the previous root's data LBA (0 = none) for a future log walk;
+// in v0 the superblock root pointer is authoritative and the header is informational.
+const REC_MAGIC: u64 = 0x4361_6972_6E_5265; // "CairnRe" — a record-header magic
+const RH_MAGIC: usize = 0;
+const RH_LEN: usize = 8;
+const RH_HASH: usize = 16;
+const RH_PREV: usize = 24;
+const RH_HDR_HASH: usize = 32;
+
 /// In-RAM mounted superblock.
 #[derive(Clone, Copy)]
 pub struct Superblock {
@@ -38,9 +57,9 @@ pub struct Superblock {
     pub root_hash: u64,
 }
 
-// The mounted superblock + flag. Written at mount; READ by INC5's put/read (append log +
-// Extent caps), so allow dead-code until then.
-#[allow(dead_code)]
+// The mounted superblock + flag. Written at mount, advanced by every committed `put`.
+// SAFETY contract: single-CPU, accessed only with interrupts off (boot self-tests are
+// pre-`sti`; mirrors the capspace side-table discipline).
 static mut MOUNTED: Superblock = Superblock {
     seq: 0,
     log_head_lba: 0,
@@ -48,17 +67,28 @@ static mut MOUNTED: Superblock = Superblock {
     root_len: 0,
     root_hash: 0,
 };
-#[allow(dead_code)]
 static mut MOUNTED_OK: bool = false;
+/// LBA of the superblock slot currently holding the live (mounted) superblock. The next
+/// commit writes the OTHER slot and flips this — the A/B double-buffer linearization point.
+static mut MOUNTED_SLOT: u64 = LBA_SB_A;
 
-/// FNV-1a 64-bit content hash (v0; a 256-bit Merkle hash tying into attestation is deferred).
-pub fn fnv1a(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a 64-bit basis offset (the empty-input hash).
+const FNV1A_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// One FNV-1a streaming step: fold `data` into the running hash `h`. Lets a multi-sector
+/// extent be hashed sector-by-sector (the on-disk read-back path) with the same result as
+/// hashing the whole byte slice at once.
+fn fnv1a_step(mut h: u64, data: &[u8]) -> u64 {
     for &b in data {
         h ^= b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
+}
+
+/// FNV-1a 64-bit content hash (v0; a 256-bit Merkle hash tying into attestation is deferred).
+pub fn fnv1a(data: &[u8]) -> u64 {
+    fnv1a_step(FNV1A_BASIS, data)
 }
 
 #[inline]
@@ -113,20 +143,33 @@ fn write_superblock(slot_lba: u64, sb: &Superblock) -> bool {
     virtio_blk::write_sector(slot_lba, &s) && virtio_blk::flush()
 }
 
-/// Read + validate a superblock slot. None if magic mismatches or the content hash fails
-/// (a torn/partial write).
-fn read_superblock(slot_lba: u64) -> Option<Superblock> {
+/// Outcome of reading one superblock slot. Crucially distinguishes a device-level read
+/// FAILURE (`Io` — the slot's on-disk contents are UNKNOWN, so it may still hold the latest
+/// committed superblock and must NEVER be reformatted over) from a slot that was successfully
+/// read but is fresh/torn (`Invalid` — legitimately format-eligible). Conflating these two
+/// (the original `Option`, where both collapsed to `None`) let a single transient read glitch
+/// on the only good slot drive `mount()` into the format path, destroying all committed data.
+#[derive(Clone, Copy)]
+enum SlotRead {
+    Io,               // read_sector failed at the device level (contents unknown)
+    Invalid,          // read OK, but the magic or content-hash check failed (fresh/torn)
+    Valid(Superblock),
+}
+
+/// Read + validate a superblock slot. `Io` if the block read failed; `Invalid` if magic
+/// mismatches or the content hash fails (a torn/partial write or a fresh slot); else `Valid`.
+fn read_superblock(slot_lba: u64) -> SlotRead {
     let mut s = [0u8; 512];
     if !virtio_blk::read_sector(slot_lba, &mut s) {
-        return None;
+        return SlotRead::Io;
     }
     if rd_u64(&s, O_MAGIC) != SB_MAGIC {
-        return None;
+        return SlotRead::Invalid;
     }
     if fnv1a(&s[0..O_SB_HASH]) != rd_u64(&s, O_SB_HASH) {
-        return None; // torn / corrupt
+        return SlotRead::Invalid; // torn / corrupt
     }
-    Some(Superblock {
+    SlotRead::Valid(Superblock {
         seq: rd_u64(&s, O_SEQ),
         log_head_lba: rd_u64(&s, O_LOG_HEAD),
         root_lba: rd_u64(&s, O_ROOT_LBA),
@@ -135,30 +178,41 @@ fn read_superblock(slot_lba: u64) -> Option<Superblock> {
     })
 }
 
-/// Mount the store: read both superblock slots, pick the higher VALID seq; if neither is
-/// valid, format the disk (write superblock A, seq=1, empty root). Prints the outcome.
+/// Mount the store: read both superblock slots, pick the higher VALID seq. If NEITHER slot
+/// is valid, format the disk (write superblock A, seq=1, empty root) — but ONLY when both
+/// slots were successfully READ and found fresh/torn. If EITHER slot's read failed at the
+/// device level (`Io`), that slot may still hold the latest committed superblock, so we
+/// REFUSE to format (which would overwrite it) and leave the store unmounted. Prints the
+/// outcome.
 pub fn mount() {
     let a = read_superblock(LBA_SB_A);
     let b = read_superblock(LBA_SB_B);
-    let best = match (a, b) {
-        (Some(x), Some(y)) => Some(if x.seq >= y.seq { x } else { y }),
-        (Some(x), None) => Some(x),
-        (None, Some(y)) => Some(y),
-        (None, None) => None,
+    // Pick the higher VALID seq, carrying the slot LBA so `put`'s commit knows which to flip.
+    let best: Option<(Superblock, u64)> = match (a, b) {
+        (SlotRead::Valid(x), SlotRead::Valid(y)) => {
+            Some(if x.seq >= y.seq { (x, LBA_SB_A) } else { (y, LBA_SB_B) })
+        }
+        (SlotRead::Valid(x), _) => Some((x, LBA_SB_A)),
+        (_, SlotRead::Valid(y)) => Some((y, LBA_SB_B)),
+        _ => None,
     };
     match best {
-        Some(sb) => {
+        Some((sb, slot)) => {
             // SAFETY: single-CPU, IRQs off; sole writer of MOUNTED at boot.
             unsafe {
                 MOUNTED = sb;
                 MOUNTED_OK = true;
+                MOUNTED_SLOT = slot;
             }
             crate::serial_println!(
                 "objstore: mounted superblock seq={} root_hash={:#x} log_head={} (slots A={} B={})",
-                sb.seq, sb.root_hash, sb.log_head_lba, a.is_some(), b.is_some()
+                sb.seq, sb.root_hash, sb.log_head_lba,
+                matches!(a, SlotRead::Valid(_)), matches!(b, SlotRead::Valid(_))
             );
         }
-        None => {
+        // No valid superblock. Only FORMAT when both slots were definitively read and are
+        // fresh/torn; an `Io` on either slot means its contents are unknown — do NOT clobber it.
+        None if matches!(a, SlotRead::Invalid) && matches!(b, SlotRead::Invalid) => {
             let sb = Superblock {
                 seq: 1,
                 log_head_lba: LBA_LOG_START,
@@ -171,6 +225,7 @@ pub fn mount() {
                 unsafe {
                     MOUNTED = sb;
                     MOUNTED_OK = true;
+                    MOUNTED_SLOT = LBA_SB_A;
                 }
                 crate::serial_println!(
                     "objstore: formatted (no valid superblock) -> seq=1 log_head={}",
@@ -180,5 +235,123 @@ pub fn mount() {
                 crate::serial_println!("objstore: format FAILED (block write/flush error)");
             }
         }
+        None => {
+            // A read failed at the device level — refuse to format over a possibly-live slot.
+            crate::serial_println!(
+                "objstore: mount FAILED — superblock read error (A={} B={}); refusing to format (would risk overwriting a committed slot)",
+                matches!(a, SlotRead::Io), matches!(b, SlotRead::Io)
+            );
+        }
     }
+}
+
+/// Append `bytes` to the log as a new content-addressed extent and commit it. Returns
+/// `(data_lba, len, content_hash)` of the committed extent, or `None` on any block error
+/// (in which case nothing is committed — the previous superblock stays authoritative).
+///
+/// Sequence (the durable-by-construction write path):
+/// 1. write the data sectors (zero-padded tail) starting at the mounted `log_head_lba`;
+/// 2. write the record header in the sector AFTER the data (data-before-header: a torn
+///    tail can never be advertised as a record);
+/// 3. `flush` (data + header durable before the commit);
+/// 4. write the OTHER superblock slot with `seq+1`, the new root `{lba,len,hash}`, and an
+///    advanced `log_head` — `write_superblock` flushes again. **This flip is the commit.**
+///
+/// Content addressing + CoW: identical `bytes` always hash to the same `content_hash` but
+/// are appended at a fresh `log_head` each call (an immutable, never-overwritten extent).
+pub fn put(bytes: &[u8]) -> Option<(u64, u32, u64)> {
+    // SAFETY: single-CPU, IRQs off; snapshot the mounted state (sole accessor).
+    let (cur, ok, slot) = unsafe { (MOUNTED, MOUNTED_OK, MOUNTED_SLOT) };
+    if !ok {
+        return None;
+    }
+    let len = bytes.len();
+    if len > u32::MAX as usize {
+        return None;
+    }
+    let ndata = len.div_ceil(512) as u64; // 0 for an empty object (degenerate but valid)
+    let data_lba = cur.log_head_lba;
+    let h = fnv1a(bytes);
+
+    // 1. Data sectors (zero-padded final sector).
+    let mut written = 0usize;
+    let mut s = 0u64;
+    while s < ndata {
+        let mut sect = [0u8; 512];
+        let remaining = len - written;
+        let n = if remaining >= 512 { 512 } else { remaining };
+        sect[..n].copy_from_slice(&bytes[written..written + n]);
+        if !virtio_blk::write_sector(data_lba + s, &sect) {
+            return None;
+        }
+        written += n;
+        s += 1;
+    }
+
+    // 2. Record header, in the sector AFTER the data (data-before-header).
+    let hdr_lba = data_lba + ndata;
+    let mut hdr = [0u8; 512];
+    wr_u64(&mut hdr, RH_MAGIC, REC_MAGIC);
+    wr_u32(&mut hdr, RH_LEN, len as u32);
+    wr_u64(&mut hdr, RH_HASH, h);
+    wr_u64(&mut hdr, RH_PREV, cur.root_lba); // chain to the previous root (0 = none)
+    let hh = fnv1a(&hdr[0..RH_HDR_HASH]);
+    wr_u64(&mut hdr, RH_HDR_HASH, hh);
+    if !virtio_blk::write_sector(hdr_lba, &hdr) {
+        return None;
+    }
+
+    // 3. Flush data + header durable before the commit.
+    if !virtio_blk::flush() {
+        return None;
+    }
+
+    // 4. Commit: write the OTHER superblock slot (seq+1, new root, advanced log_head), flush.
+    let new_sb = Superblock {
+        seq: cur.seq + 1,
+        log_head_lba: hdr_lba + 1,
+        root_lba: data_lba,
+        root_len: len as u32,
+        root_hash: h,
+    };
+    let other = if slot == LBA_SB_A { LBA_SB_B } else { LBA_SB_A };
+    if !write_superblock(other, &new_sb) {
+        // Commit not acknowledged: either the sector write failed (previous superblock stays
+        // authoritative) or only the FLUSH failed (new-slot durability is indeterminate under
+        // writeback). Either way we do NOT advance MOUNTED; mount() deterministically picks
+        // the highest VALID seq next boot, so no torn/partial extent is ever advertised.
+        return None;
+    }
+
+    // Commit point passed — publish the new mounted state in RAM.
+    // SAFETY: single-CPU, IRQs off; sole writer of MOUNTED.
+    unsafe {
+        MOUNTED = new_sb;
+        MOUNTED_SLOT = other;
+    }
+    Some((data_lba, len as u32, h))
+}
+
+/// Re-read an extent's bytes from disk and return their FNV-1a content hash, or `None` on a
+/// block error. Reads `ceil(len/512)` sectors from `lba` and hashes the first `len` bytes —
+/// so the result equals the `content_hash` `put` committed iff the on-disk bytes are intact.
+/// This is the read-back leg of the INC5 proof and the seed for INC6 recovery verification.
+pub fn extent_content_hash(lba: u64, len: u32) -> Option<u64> {
+    let len = len as usize;
+    let nsect = len.div_ceil(512) as u64;
+    let mut h = FNV1A_BASIS;
+    let mut consumed = 0usize;
+    let mut s = 0u64;
+    while s < nsect {
+        let mut sect = [0u8; 512];
+        if !virtio_blk::read_sector(lba + s, &mut sect) {
+            return None;
+        }
+        let remaining = len - consumed;
+        let n = if remaining >= 512 { 512 } else { remaining };
+        h = fnv1a_step(h, &sect[..n]);
+        consumed += n;
+        s += 1;
+    }
+    Some(h)
 }

@@ -32,6 +32,7 @@ mod user;
 mod virtio_blk;
 
 use cap_core::capability::Rights;
+use cap_core::table::Status;
 use limine::request::{HhdmRequest, MemmapRequest, StackSizeRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
@@ -217,6 +218,54 @@ unsafe extern "C" fn kmain_main() -> ! {
 
     // --- Phase 3 (L3): mount the Cairnlog object store (format on first boot) ---
     objstore::mount();
+
+    // --- Phase 3 (L4): INC5 append-log put + content-addressed Extent caps ---
+    // `put` writes the data sectors + a record header, flushes, then flips the OTHER
+    // superblock slot (seq+1, new root) — that flip is the commit. We then mint an Extent
+    // cap naming the committed content and prove the whole chain:
+    //   (a) X_READ (via cap_invoke) is gated by READ and returns the content hash;
+    //   (b) extent_metadata reads the on-disk {lba,len,hash} *through* the cap;
+    //   (c) re-reading those sectors and re-hashing yields the SAME content hash — content
+    //       addressing holds end-to-end (the durable name == the bytes' hash);
+    //   (d) a READ-masked delegated copy is refused X_READ (ErrRights), and that same copy
+    //       (it holds WRITE) gets ErrMethod on X_WRITE (its bulk-data path lands in INC7).
+    // Runs in the root domain (0); the negative test uses the transient domain 3 so it
+    // never perturbs the domain-1/2 IPC slot proofs (recv_cptr / grant slot 1).
+    {
+        const EXT_NEG_DOMAIN: usize = 3;
+        let msg = b"CAIRN-EXTENT-INC5: content-addressed put + Extent cap proof";
+        match objstore::put(msg) {
+            Some((lba, len, hash)) => match capspace::mint_extent(lba, len, hash) {
+                Some(ext) => {
+                    let (rst, rhash) = capspace::cap_invoke(ext, capspace::X_READ, 0);
+                    let meta = capspace::extent_metadata(0, ext);
+                    let disk = objstore::extent_content_hash(lba, len);
+                    let content_ok = rst == Status::Ok
+                        && rhash == hash
+                        && meta == Some((lba, len, hash))
+                        && disk == Some(hash);
+                    serial_println!(
+                        "extent: put lba={} len={} hash={:#x}; X_READ=>{:?} reply_hash={:#x}; meta={:?}; on-disk re-read={:?}; content-addressed match={}",
+                        lba, len, hash, rst, rhash, meta, disk, content_ok
+                    );
+                    if let Some(nc) = capspace::delegate_from_root(
+                        EXT_NEG_DOMAIN, ext, Rights::INVOKE | Rights::WRITE, 0,
+                    ) {
+                        let (no_read, _) =
+                            capspace::cap_invoke_in(EXT_NEG_DOMAIN, nc, capspace::X_READ, 0);
+                        let (wr, _) =
+                            capspace::cap_invoke_in(EXT_NEG_DOMAIN, nc, capspace::X_WRITE, 0);
+                        serial_println!(
+                            "extent: READ-masked cap X_READ=>{:?} (expect ErrRights); X_WRITE=>{:?} (expect ErrMethod, data path=INC7)",
+                            no_read, wr
+                        );
+                    }
+                }
+                None => serial_println!("extent: mint_extent failed"),
+            },
+            None => serial_println!("extent: objstore::put failed"),
+        }
+    }
 
     // --- self-tests (as specified) ---
 

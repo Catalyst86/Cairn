@@ -53,6 +53,18 @@ pub const N_POLL: u16 = 2;
 pub const E_SEND: u16 = 1;
 pub const E_RECV: u16 = 2;
 
+/// Method IDs for the Extent object kind (Phase 3 content-addressed store, INC5).
+/// `X_READ` (needs INVOKE|READ) returns the extent's metadata — in the register ABI, the
+/// content hash (the durable name); the full `{lba,len,hash}` triple is read via
+/// [`extent_metadata`]. Bytes themselves reach a domain via Extent **MAP** (INC7), never a
+/// register (CAP_ABI §5: the core is not in the bulk data path). `X_WRITE`/`X_COMMIT` (need
+/// INVOKE|WRITE) mint a NEW content-addressed extent — their bulk-data path is wired with
+/// Extent MAP in INC7, so in INC5 a rights-valid X_WRITE/X_COMMIT returns `ErrMethod` (the
+/// rights gate is live; the write path is not yet).
+pub const X_READ: u16 = 1;
+pub const X_WRITE: u16 = 2;
+pub const X_COMMIT: u16 = 3;
+
 /// The sole "no capability" sentinel for the IPC `xfer` (inbound) and `reply_cptr`
 /// (outbound) slots — equals the userspace `syscall::CPTR_NULL` (0xffff). A real CPtr
 /// is `0..CAP_TABLE_SLOTS`, so 0 is an ordinary, transferable slot — NOT a second null.
@@ -119,6 +131,21 @@ const EP_EMPTY: EpSlot = EpSlot {
 /// Per-endpoint rendezvous state. const static-init (no boot-stack temporary).
 /// SAFETY contract: single-CPU, accessed only with interrupts off (see module docs).
 static mut ENDPOINTS: [EpSlot; OBJECT_TABLE_SIZE] = [EP_EMPTY; OBJECT_TABLE_SIZE];
+
+/// Per-Extent metadata payload, indexed by `object_id` (Phase 3 INC5). cap-core's
+/// `ObjectMeta` is frozen, so the extent's on-disk location/length/content-hash live here,
+/// mirroring [`NOTIFY`]/[`ENDPOINTS`]: cap-core holds the cap (authority/type/epoch), the
+/// kernel holds the object's contents. The `hash` IS the durable content name.
+#[derive(Clone, Copy)]
+struct ExtentMeta {
+    lba: u64,
+    len: u32,
+    hash: u64,
+}
+const EXT_EMPTY: ExtentMeta = ExtentMeta { lba: 0, len: 0, hash: 0 };
+/// Per-Extent side-table. const static-init (no boot-stack temporary).
+/// SAFETY contract: single-CPU, accessed only with interrupts off (see module docs).
+static mut EXTENTS: [ExtentMeta; OBJECT_TABLE_SIZE] = [EXT_EMPTY; OBJECT_TABLE_SIZE];
 
 /// Throttle for endpoint proof prints.
 static EP_REPORTS: AtomicU64 = AtomicU64::new(0);
@@ -244,6 +271,8 @@ fn dispatch_method(kind: ObjectKind, oid: u64, rights: Rights, method: u16, arg:
     let extra = match (kind, method) {
         (ObjectKind::Notification, N_SIGNAL) => Rights::WRITE,
         (ObjectKind::Notification, N_POLL) => Rights::READ,
+        (ObjectKind::Extent, X_READ) => Rights::READ,
+        (ObjectKind::Extent, X_WRITE) | (ObjectKind::Extent, X_COMMIT) => Rights::WRITE,
         _ => Rights::empty(),
     };
     if !rights.contains(extra) {
@@ -276,6 +305,23 @@ fn dispatch_method(kind: ObjectKind, oid: u64, rights: Rights, method: u16, arg:
             (Status::Ok, 0)
         }
         (ObjectKind::Notification, N_POLL) => (Status::Ok, notify_take(oid)),
+        // Extent X_READ: metadata-only — return the content hash (the durable name) in the
+        // single reply register. lba/len are read via `extent_metadata`; bytes via Extent
+        // MAP (INC7), never a register. READ was enforced by the `extra` gate above.
+        (ObjectKind::Extent, X_READ) => {
+            let i = oid as usize;
+            let h = if i < OBJECT_TABLE_SIZE {
+                // SAFETY: single-CPU, IRQs off; `i` bounds-checked; shared read of EXTENTS.
+                unsafe { (*core::ptr::addr_of!(EXTENTS))[i].hash }
+            } else {
+                0
+            };
+            (Status::Ok, h)
+        }
+        // Extent X_WRITE/X_COMMIT: WRITE was enforced above, but the content-addressed write
+        // path needs the bytes, which arrive via Extent MAP in INC7. So a rights-valid write
+        // falls through to ErrMethod here (the rights gate is proven; the write path is not
+        // yet wired) — distinct from the ErrRights a cap lacking WRITE gets at the gate.
         _ => (Status::ErrMethod, 0),
     }
 }
@@ -634,6 +680,63 @@ pub fn mint_timeslice() -> Option<u16> {
     let doms = unsafe { &mut *core::ptr::addr_of_mut!(DOMAINS) };
     let object_id = objs_g.create_object(ObjectKind::TimeSlice)?;
     doms.tables[0].mint(&*objs_g, object_id, Rights::INVOKE, 0).ok()
+}
+
+/// Create an Extent object naming a committed content-addressed store extent (Phase 3 INC5)
+/// and mint a fully-powered root cap for it in the ROOT domain: rights =
+/// INVOKE|READ|WRITE|MAP|DELEGATE. INVOKE is the universal "may call methods" right the
+/// verified `CapTable::invoke` requires; READ gates `X_READ`, WRITE gates `X_WRITE`/`X_COMMIT`,
+/// MAP is the INC7 zero-kernel Extent-map right (defined now, first used then), DELEGATE lets
+/// the cap (or a rights-subset) be handed to another domain. The `{lba,len,hash}` (from
+/// [`crate::objstore::put`]) lives in `EXTENTS[oid]` because cap-core's `ObjectMeta` is frozen.
+/// Returns the root-domain CPtr.
+pub fn mint_extent(lba: u64, len: u32, hash: u64) -> Option<u16> {
+    let mut objs_g = objects().lock();
+    // SAFETY: single-CPU, IRQs off; sole accessor of DOMAINS in this region.
+    let doms = unsafe { &mut *core::ptr::addr_of_mut!(DOMAINS) };
+    let oid = objs_g.create_object(ObjectKind::Extent)?;
+    let i = oid as usize;
+    if i >= OBJECT_TABLE_SIZE {
+        return None;
+    }
+    // SAFETY: single-CPU, IRQs off; sole writer of EXTENTS[oid] at mint.
+    unsafe {
+        (*core::ptr::addr_of_mut!(EXTENTS))[i] = ExtentMeta { lba, len, hash };
+    }
+    let rights = Rights::INVOKE | Rights::READ | Rights::WRITE | Rights::MAP | Rights::DELEGATE;
+    doms.tables[0].mint(&*objs_g, oid, rights, 0).ok()
+}
+
+/// Read an Extent cap's full metadata `{lba, len, hash}` after a verified `invoke`
+/// (INVOKE) + type==Extent + READ-right check in `domain`. This is the `X_READ`
+/// "returns metadata" path with all three fields — the register-ABI [`cap_invoke`] can
+/// only return the content hash, so callers needing `lba`/`len` (the proof's read-back,
+/// and INC7's Extent MAP) use this. Returns `None` if the cap is absent/revoked, the wrong
+/// type, or lacks READ.
+pub fn extent_metadata(domain: usize, cptr: u16) -> Option<(u64, u32, u64)> {
+    let domain = domain.min(MAX_DOMAINS - 1);
+    let oid = {
+        let objs_g = objects().lock();
+        // SAFETY: single-CPU, IRQs off; shared read of DOMAINS.
+        let doms = unsafe { &*core::ptr::addr_of!(DOMAINS) };
+        let tbl = &doms.tables[domain];
+        if tbl.invoke(&*objs_g, cptr, X_READ, Rights::INVOKE) != Status::Ok {
+            return None;
+        }
+        match tbl.lookup(cptr, &*objs_g) {
+            Ok(e) if e.type_tag == ObjectKind::Extent && e.rights.contains(Rights::READ) => {
+                e.object_id
+            }
+            _ => return None,
+        }
+    };
+    let i = oid as usize;
+    if i >= OBJECT_TABLE_SIZE {
+        return None;
+    }
+    // SAFETY: single-CPU, IRQs off; shared read of EXTENTS.
+    let m = unsafe { (*core::ptr::addr_of!(EXTENTS))[i] };
+    Some((m.lba, m.len, m.hash))
 }
 
 /// Admission gate: the ROOT-domain cap at `cptr` must validate via the VERIFIED

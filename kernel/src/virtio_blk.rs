@@ -442,18 +442,22 @@ pub fn smoke_test(hhdm: u64) {
     if !init(hhdm) {
         return;
     }
-    // LBA 0/1 are claimed by the Cairnlog superblock (objstore), so the L2 read+write
-    // proof uses LBA 8 — a round-trip exercises both the read and write paths.
+    // LBA 0/1 are the Cairnlog superblock and LBA 2.. is the objstore append-log, which GROWS
+    // every boot (each `put` appends sectors). So the L2 read+write proof must NOT scribble
+    // anywhere the log can reach, or it would silently corrupt a committed extent. Use a
+    // SCRATCH sector near the end of the 16 MiB disk (32768 sectors, LBAs 0..32767), well clear
+    // of the log. A round-trip exercises both the read and write paths.
+    const SMOKE_LBA: u64 = 32760;
     let mut wbuf = [0u8; 512];
     for (i, b) in wbuf.iter_mut().enumerate() {
         *b = (i as u8) ^ 0xA5;
     }
     let mut rbuf = [0u8; 512];
-    let rt = write_sector(8, &wbuf) && read_sector(8, &mut rbuf) && wbuf == rbuf;
+    let rt = write_sector(SMOKE_LBA, &wbuf) && read_sector(SMOKE_LBA, &mut rbuf) && wbuf == rbuf;
     // SAFETY: scalar read of the driver flag, single-CPU IRQs off.
     let flush_ok = unsafe { (*core::ptr::addr_of!(VBLK)).flush_ok };
     crate::serial_println!(
-        "virtio-blk: wrote+read LBA8 512B match={} (flush negotiated={})",
-        rt, flush_ok
+        "virtio-blk: wrote+read LBA{} 512B match={} (flush negotiated={})",
+        SMOKE_LBA, rt, flush_ok
     );
 }
