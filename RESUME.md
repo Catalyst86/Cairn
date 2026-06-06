@@ -10,26 +10,30 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    terminated: #UD rip=0x420025 — crash-only: kernel survives`, FOLLOWED BY the full 4b endpoint
    rendezvous (`ep: domain2 E_RECV resumed … recv_cptr=3`, MOVE proof `cptr=1 => status=1`) and
    the `perdomain:`/`notify:`/`GRANT_CAP gate` lines — **no panic/halt** anywhere.
-2. **Two good next steps (pick by appetite):**
-   - **Finish crash-only → restart/self-healing (4c, smaller):** re-admit a fresh instance of a
-     terminated domain (fresh CapTable + re-granted caps, reusing the freed task slot), with a
-     restart-count cap so a crash-loop is reaped. The slot+machinery are ready
-     (`terminate_current` frees the slot; `admit_user` re-fills). Also close the documented v0
-     gaps in `docs/CRASH_ONLY.md`: the one-directional endpoint scrub (a survivor parked waiting
-     for a dead task blocks forever — needs peer-tracking/timeouts), and per-domain frame
-     reclamation on death (the faulter's `M_ALLOC`'d frame leaks). Plus optional IPC 4c polish:
-     blocking `N_WAIT`, multi-waiter endpoint queues (see `docs/PORTAL_IPC.md`).
-   - **Phase 3 — zero-kernel I/O + object store (the Roadmap's major next):** PCIe enum,
-     virtio-blk/net, direct queue mapping, a log-structured object store + extent caps; objects
-     survive reboot. Big; greenfield (good Claude×Grok split).
+2. **Phase 2 is COMPLETE** (domains, EDF, portal IPC, crash-only supervision + restart). The
+   Roadmap's major next is **Phase 3 — zero-kernel I/O + object store:** PCIe enum, virtio-blk/
+   net, direct queue mapping, a log-structured object store + extent caps; objects survive
+   reboot. Big, greenfield (good Claude×Grok split). Start with a design panel + a thin vertical
+   slice (e.g. virtio-blk read/write of one extent via a DeviceQueue cap mapped into a domain).
+   - **Or small polish before Phase 3** (all in `docs/CRASH_ONLY.md` / `docs/PORTAL_IPC.md`
+     "deferred"): survivor-liveness scrub (a survivor parked waiting for a dead task blocks
+     forever — needs endpoint peer-tracking / IPC timeouts); per-domain frame+object reclamation
+     on death (currently bounded-leak); blocking `N_WAIT`; multi-waiter endpoint queues.
 3. **cap-core stays byte-unchanged** (the regression gate; `git diff HEAD -- crates/` must be
-   empty). NOTE: `kani-proofs.sh` currently HANGS on the frame-alloc proofs (a prior session left
-   stale `cbmc` running — kill any `cbmc`/`cargo-kani`/`kani-driver` by NAME first, `pkill -9
-   cbmc`, NOT `-f` which self-matches). cap-core's 4 proofs already pass; to re-confirm run only
-   `cargo kani -p cap-core --features kani`. git HEAD at handoff = crash-only commit `b5362c3`
-   (run `git log --oneline -10`).
+   empty). NOTE: `kani-proofs.sh` HANGS on the frame-alloc proofs (a prior session left stale
+   `cbmc` running — kill any `cbmc`/`cargo-kani`/`kani-driver` by NAME first: `pkill -9 cbmc`,
+   NOT `-f` which self-matches the kill command). cap-core's 4 proofs already pass; to re-confirm
+   run ONLY `cargo kani -p cap-core --features kani`. git HEAD at handoff = crash-only RESTART
+   commit `a1b37bf` (run `git log --oneline -12`).
 
-## Status (Phase 2: crash-only domain supervision) ✅
+## Status (Phase 2: crash-only domain supervision + restart) ✅
+- ✅ **Restart / self-healing** (commit `a1b37bf`; `supervisor.rs`): `terminate_current` calls
+  `supervisor::on_domain_death(domain)` (after reap, before pick_next) which, for a registered
+  restartable domain with budget left, decrements and **re-admits a fresh instance** (fresh caps
+  into the reaped domain table, reused slot, pages persist). Budget 0 ⇒ stays reaped. Re-entrancy
+  sound (terminate holds only a raw SCHED ptr; admit_user's transient `&mut` doesn't alias).
+  Focused adversarial review: 0 confirmed findings. Verified: faulter `#UD` → RESTARTED (budget
+  2→1→0) → reaped, kernel + endpoint demo alive throughout (3 terminations, 2 restarts, 0 faults).
 - ✅ **A ring-3 fault terminates just that domain; the kernel + other domains live on**
   (commit `b5362c3`; `docs/CRASH_ONLY.md`). DESIGN.md pillar 8. Implemented directly (it
   extends the 4b block/wake machinery) + put through a 4-dimension adversarial review (2
@@ -257,8 +261,8 @@ ring 3 + syscall + first userspace cap_invoke ✅ → ring-3 hardening (M_FREE g
 per-domain CapTables + Notification async IPC ✅ (step 4a) → portal IPC endpoints (sync
 rendezvous) + scheduler block/wake + cap-transfer + 2nd ring-3 task ✅ (step 4b) →
 crash-only domain supervision (ring-3 fault terminates the domain, not the kernel) ✅ →
-**4c crash-only restart/self-healing + IPC polish (small) OR Phase 3 zero-kernel I/O +
-object store (major) — NEXT** →
+crash-only restart / self-healing (supervisor re-admits under a budget) ✅ (Phase 2 COMPLETE) →
+**Phase 3 — zero-kernel I/O + object store (PCIe/virtio + extent caps) — NEXT** →
 Ring-3 follow-ups (deferred, see commit): fair co-scheduling (round-robin on equal EDF
 deadlines — currently lowest-index wins, so a co-scheduled shorter-period task starves the
 user task; demo runs the ring-3 task solo), return a Memory CPtr not a raw frame number to
