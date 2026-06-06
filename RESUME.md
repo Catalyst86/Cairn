@@ -11,23 +11,33 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    domain 4 … (1 restart(s) left)` → terminated → `RESTARTED … (0 left)` → terminated →
    `supervisor: domain 4 reaped — restart budget exhausted`; FOLLOWED BY the full 4b endpoint
    rendezvous (`ep: domain2 E_RECV resumed … recv_cptr=3`, MOVE proof `cptr=1 => status=1`) plus
-   the `perdomain:`/`notify:`/`GRANT_CAP gate` lines — **no panic/halt** anywhere (≈66 serial
-   lines: 3 terminations, 2 restarts).
+   the `perdomain:`/`notify:`/`GRANT_CAP gate` lines — **no panic/halt** anywhere. PLUS the Phase 3
+   lines (early, right after the heap): `pci …` device list incl. `pci 00:03.0 vendor=0x1af4
+   device=0x1042 … virtio-blk`; `virtio-blk: ready (queue0 size=128)`; `virtio-blk: wrote+read LBA8
+   512B match=true (flush negotiated=true)`; and `objstore: mounted superblock seq=1 …` (or
+   `objstore: formatted -> seq=1` on a fresh `/root/cairn-disk.img`). (`rm /root/cairn-disk.img` to
+   reset the store.) Note the old INC2 "read LBA0 magic" line is GONE — LBA0/1 now hold the
+   superblock.
 2. **Phase 3 is UNDERWAY** (zero-kernel I/O + object store; architected in `docs/PHASE3.md`).
-   **INC1 (PCI enum) ✅** + **INC2 (polled virtio-blk driver) ✅** + **INC3 (write round-trip) ✅**
-   — the L2 block layer is complete: `virtio_blk::read_sector`/`write_sector(lba, &[u8;512])`
-   (one shared `submit()` path). **NEXT = INC4: Cairnlog superblock + content hashing.** In a new
-   `objstore.rs`: a from-scratch content hash (FNV-1a 64 is fine to start), an A/B double-buffered
-   superblock at LBA0/1 `{magic,version,seq:u64,log_head_lba,root_lba,root_len,root_hash[32],
-   sb_hash[32]}`, format-on-first-boot, write a superblock, read both back, validate `sb_hash`,
-   pick the higher valid `seq`. Crash-consistency REQUIRES a flush before the superblock flip —
-   negotiate `VIRTIO_BLK_F_FLUSH` in `virtio_blk::init` and add a `flush()` (a 0-data
-   `VIRTIO_BLK_T_FLUSH=4` request). NOTE: the superblock at LBA0/1 overwrites INC2's sector-0
-   magic — fine, that was only INC2's read target. **Then INC5** (append-log `put` + Extent caps
-   wired into `dispatch_method`: `X_READ`/`X_WRITE`/`X_COMMIT`), **INC6** (objects survive reboot —
-   `/root/cairn-disk.img` persists across runs; a 2-run or boot-count proof), **INC7** (zero-kernel
-   DeviceQueue grant). Full plan + DMA trust boundary + crash-consistency: `docs/PHASE3.md`.
-   cap-core stays byte-unchanged (Extent=8/DeviceQueue=9 already exist).
+   **INC1 (PCI enum) ✅ · INC2 (virtio-blk read) ✅ · INC3 (write) ✅ · INC4 (Cairnlog superblock +
+   content hash + flush) ✅.** The L2 block layer (`virtio_blk::read_sector`/`write_sector`/`flush`,
+   one shared `submit()`) and the L3 superblock (`objstore.rs`: FNV-1a hash, A/B superblock at
+   LBA0/1, format/mount, durable via flush) both work — and the superblock PERSISTS across a QEMU
+   restart (verified: boot1 formats seq=1, boot2 mounts seq=1).
+   **NEXT = INC5: append-log `put` + content-addressed Extent caps.** In `objstore.rs`: `put(bytes)`
+   appends data sectors (then a record header — data-before-header so a torn tail is never
+   advertised) starting at `MOUNTED.log_head_lba`, content-hashes (`fnv1a`), `flush`es, then writes
+   the OTHER superblock slot with `seq+1` + the new root (lba/len/hash) and `flush`es again (the
+   flip = the commit point). Mint an **Extent cap** (`ObjectKind::Extent=8`) naming the content:
+   add `pub const X_READ/X_WRITE/X_COMMIT` in `capspace.rs`, an `EXTENTS:[ExtentMeta{lba,len,hash};
+   OBJECT_TABLE_SIZE]` const-static side-table (mirror `NOTIFY`/`ENDPOINTS`), a `mint_extent`
+   constructor, and wire `(Extent,X_READ)->READ`/`(Extent,X_WRITE|X_COMMIT)->WRITE` into
+   `dispatch_method`'s `extra`-rights match + a new `(kind,method)` arm (X_READ returns
+   `{lba,len,hash}` METADATA only — bytes reach a domain via Extent MAP, which ships with INC7).
+   **Then INC6** (objects survive reboot — re-mint the root Extent on boot from the committed
+   superblock; the disk persists in `/root`), **INC7** (zero-kernel DeviceQueue grant + Extent MAP).
+   Full plan + DMA trust boundary + crash-consistency in `docs/PHASE3.md`. cap-core byte-unchanged
+   (Extent=8/DeviceQueue=9 already exist; `objstore.rs` has `MOUNTED`/`fnv1a` ready for INC5).
    - **Or small Phase-2 polish** (`docs/CRASH_ONLY.md`/`PORTAL_IPC.md` "deferred"):
      survivor-liveness scrub, per-domain frame reclamation on death, blocking `N_WAIT`.
 3. **cap-core stays byte-unchanged** (the regression gate; `git diff HEAD -- crates/` must be
@@ -35,8 +45,8 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    `cbmc` running — kill any `cbmc`/`cargo-kani`/`kani-driver` by NAME first: `pkill -9 cbmc`,
    NOT `-f` which self-matches the kill command). cap-core's 4 proofs already pass; to re-confirm
    run ONLY `cargo kani -p cap-core --features kani`. At handoff the last FEATURE commit is
-   Phase 3 INC3 (virtio-blk write) `b782c2f` (HEAD is the RESUME-update commit after it; run
-   `git log --oneline -18`).
+   Phase 3 INC4 (Cairnlog superblock) `6a29905` (HEAD is the RESUME-update commit after it; run
+   `git log --oneline -20`).
 
 ## Status (Phase 3: zero-kernel I/O + object store — UNDERWAY) 🚧
 - ✅ **INC1 — PCI bus enumeration** (commit `4218ace`; `pci.rs`, `docs/PHASE3.md`). Architected
@@ -55,10 +65,15 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
   the reusable L2 primitive. DMA = raw guest-phys, rings via HHDM.
 - ✅ **INC3 — write round-trip** (commit `b782c2f`): `virtio_blk::write_sector` via a shared
   `submit()`; `wrote+read LBA8 512B match=true`. L2 block layer (read+write) complete.
-- 🚧 **NEXT = INC4 Cairnlog superblock + content hashing** (`objstore.rs`; needs `VIRTIO_BLK_F_FLUSH`
-  + a `flush()`) → INC5 Extent caps → INC6 objects-survive-reboot → INC7 zero-kernel DeviceQueue
-  grant. Architecture, cap-mapping (Extent=8/DeviceQueue=9, cap-core unchanged), DMA trust
-  boundary, crash-consistency: `docs/PHASE3.md`.
+- ✅ **INC4 — Cairnlog superblock + content hash + flush** (commit `6a29905`; `objstore.rs` + flush
+  in `virtio_blk.rs`). FNV-1a hash; A/B double-buffered superblock @ LBA0/1 (validated by content
+  hash, higher-valid-seq wins); `format`-on-first-boot; `flush()` (negotiated `VIRTIO_BLK_F_FLUSH`,
+  no-data `VIRTIO_BLK_T_FLUSH` via parameterized `submit`). **Persists across reboot** (boot1
+  formats seq=1, boot2 mounts seq=1 — the foundation for INC6). `MOUNTED`/`fnv1a` are ready for INC5.
+- 🚧 **NEXT = INC5 append-log put + Extent caps** (`X_READ`/`X_WRITE`/`X_COMMIT` + `EXTENTS`
+  side-table in `capspace.rs`, mirror `NOTIFY`) → INC6 objects-survive-reboot (re-mint root Extent
+  on boot) → INC7 zero-kernel DeviceQueue grant + Extent MAP. Architecture, cap-mapping
+  (Extent=8/DeviceQueue=9, cap-core unchanged), DMA trust boundary, crash-consistency: `docs/PHASE3.md`.
 
 ## Status (Phase 2: crash-only domain supervision + restart) ✅
 - ✅ **Restart / self-healing** (commit `a1b37bf`; `supervisor.rs`): `terminate_current` calls
@@ -303,8 +318,9 @@ rendezvous) + scheduler block/wake + cap-transfer + 2nd ring-3 task ✅ (step 4b
 crash-only domain supervision (ring-3 fault terminates the domain, not the kernel) ✅ →
 crash-only restart / self-healing (supervisor re-admits under a budget) ✅ (Phase 2 COMPLETE) →
 **Phase 3 — zero-kernel I/O + object store: PCI enum ✅ (INC1) → polled virtio-blk driver ✅
-(INC2) → write round-trip ✅ (INC3) → Cairnlog superblock (INC4, NEXT) → Extent caps →
-objects-survive-reboot (INC6) → DeviceQueue zero-kernel grant (INC7); see docs/PHASE3.md** →
+(INC2) → write round-trip ✅ (INC3) → Cairnlog superblock+hash+flush ✅ (INC4) → append-log
+put + Extent caps (INC5, NEXT) → objects-survive-reboot (INC6) → DeviceQueue zero-kernel grant
+(INC7); see docs/PHASE3.md** →
 Ring-3 follow-ups (deferred, see commits): fair co-scheduling (the demo now co-schedules
 faulter+client+server across domains and works, but equal EDF deadlines are still broken by
 lowest-index — no round-robin among equal deadlines), return a Memory CPtr (not a raw frame) to

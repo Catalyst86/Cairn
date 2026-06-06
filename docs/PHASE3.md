@@ -79,7 +79,10 @@ ephemeral — sealed sparse 128-bit persisted tokens are CAP_ABI §7, deferred).
   anti-hang guard. **Proof:** print the pre-seeded sector-0 magic `CAIRN-DISK-SECTOR-0-MAGIC-v0`.
 - **INC3 — one-sector WRITE round-trip ✅ DONE** (commit `b782c2f`): `write_sector` via a shared
   `submit()`; `wrote+read LBA8 512B match=true`. L2 block layer (read+write) complete.
-- **INC4 — Cairnlog superblock + checksums** (FNV-1a first; A/B superblock; format-on-first-boot).
+- **INC4 — Cairnlog superblock + checksums ✅ DONE** (commit `6a29905`; `objstore.rs`, flush in
+  `virtio_blk.rs`): FNV-1a hash, A/B superblock @ LBA0/1 (content-hash validated, higher-valid-seq
+  wins), format-on-first-boot, `flush()` (negotiated `VIRTIO_BLK_F_FLUSH`). Verified across 2 boots:
+  formats seq=1 then mounts seq=1 (superblock persists). LBA0/1 now store-owned (INC2 magic gone).
 - **INC5 — append-log store v0 + Extent caps** (`objstore::put`; `X_READ`/`X_WRITE`/`X_COMMIT` arms).
 - **INC6 — OBJECTS SURVIVE REBOOT (T2 milestone):** run1 puts+commits, prints hashes; QEMU exits
   (`/root/cairn-disk.img` persists); run2 `recover()` re-mints the root Extent, re-hashes, prints
