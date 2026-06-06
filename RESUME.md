@@ -6,19 +6,45 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
 
 ## ⏭ Next session — start here
 1. **Confirm the clean boot** still works: `wsl.exe -d Ubuntu -- bash /mnt/c/WSL/cairn-go-kernel.sh`
-   — expect `ring3 syscall #1..#8: cap_invoke(...) => Ok frame=0x...` and no faults.
-2. **Fold in the ring-3 adversarial review.** A review workflow (`ring3-review`, run id
-   `wviq512f3`) was IN FLIGHT at session end. If its result file still exists, read
-   `…/tasks/wviq512f3.output`; otherwise just re-run a review (`/code-review` or a fresh
-   review workflow) over the ring-3 diff. Its findings are expected to be the latent
-   hardening items already in the Roadmap (SMEP/SMAP off, raw-frame leak, M_FREE ownership,
-   sysret canonical-RIP guard, IF-during-syscall, NMI paranoid-entry, fair co-scheduling).
-   Fix any HIGH/confirmed ones; the rest are documented deferrals.
-3. **Cosmetic:** the build is warning-clean except the new nightly `function_casts_as_integer`
-   lint on `fn as usize` (interrupts.rs:47, syscall.rs:72/100, user.rs:66) — rewrite as
-   `fn as *const () as usize`. Pre-existing dead-code note on `Task` derive is benign.
-4. **Then build forward:** portal IPC (endpoints + notify caps) + per-domain CapTables (see Roadmap).
-   git HEAD at handoff = the ring-3 commit (run `git log --oneline -8`).
+   — expect the `perdomain:` + `notify:` proof lines, `EDF: admitted ring-3 user task … in
+   domain 1`, and `ring3 syscall #1..#8: cap_invoke(cptr=0, …) => Ok` with no faults.
+2. **Build portal IPC step 4b — Endpoints (sync rendezvous) + scheduler block/wake + a 2nd
+   ring-3 task.** Full plan + the cap-core constraints to respect are in `docs/PORTAL_IPC.md`
+   ("Increment 4b"). The hard part is the scheduler **block/wake** primitive
+   (`block_current`/`unblock`) cooperating with EDF `pick_next`/`roll_deadlines` without ever
+   losing a wakeup; then **Endpoint** `E_SEND`/`E_RECV` rendezvous, optional **cap-transfer**
+   via the syscall `xfer` slot (currently stubbed in `syscall_dispatch`, gated on `GRANT_CAP`),
+   and a **client+server** two-domain ring-3 demo. Good Claude×Grok split (Grok drafts the
+   rendezvous state machine; Claude integrates block/wake + cap-transfer, reviews unsafe,
+   verifies). **cap-core stays byte-unchanged** (its 4 Kani proofs must keep holding).
+3. git HEAD at handoff = the per-domain/Notification commit `9bd7246` (run `git log --oneline -8`);
+   ring-3 hardening (M_FREE gate) `6dda246` is the commit before it.
+
+## Status (Phase 2: per-domain CapTables + Notification async IPC — step 4a) ✅
+- ✅ **Per-domain CapTables + Notification IPC live** (portal-IPC step 4a; `docs/PORTAL_IPC.md`).
+  `capspace.rs` now holds `MAX_DOMAINS` per-domain CapTables (`DOMAINS`, **const static-init**
+  to avoid a boot-stack temporary — the original overflow bug class), `CURRENT_DOMAIN` +
+  `set_current_domain` (scheduler hook), `cap_invoke_in(domain,..)` routing (the verified
+  `CapTable::invoke` is still in the live path, plus a method-specific rights layer), and
+  `delegate_from_root` — the **first live use of cap-core's verified `delegate`** (I3:
+  child.rights ⊆ parent.rights). New **Notification** object: `N_SIGNAL` (OR bits into
+  `NOTIFY[oid]`, needs INVOKE|WRITE) / `N_POLL` (read+clear, needs INVOKE|READ); payload lives
+  in capspace because cap-core's `ObjectMeta` is frozen. The **live ring-3 task now runs in its
+  OWN domain (1)** with an INVOKE-only Memory cap **delegated** from root (its syscalls use
+  `cptr=0` in its own table). `sched.rs` gained `Task.domain`, `admit_user(..,domain,..)`, and a
+  per-switch `set_current_domain`. **Verified in QEMU:** `perdomain: domain2 ALLOC via
+  delegated(INVOKE-only) cap => Ok; root CPtr 1 in domain2 => ErrBadCPtr` (isolation);
+  `notify: domain2 SIGNAL=>Ok POLL(no READ)=>ErrRights; root POLL=>Ok bits=0b101 then 0b0`
+  (cross-domain async IPC, rights enforced); ring-3 8× `M_ALLOC` via its delegated cap; no
+  faults. **cap-core byte-unchanged** (4 Kani proofs still hold). Claude-led integration.
+- ✅ **Ring-3 adversarial review folded in + hardening** (commit `6dda246`). One HIGH, confirmed,
+  reachable-from-ring-3 finding fixed: **`M_FREE` arbitrary-frame free** (privesc) — an untrusted
+  frame number went straight to `deallocate_frame` with no ownership check; now **refused
+  (`ErrMethod`)** until `M_ALLOC` returns a Memory CPtr the kernel can ownership-check (boot-log
+  proof `cap_invoke(M_FREE, 0x100) => ErrMethod`). Rest of the review = the Roadmap's documented
+  deferrals (raw-frame leak, sysret canonical-RIP guard, IF-during-syscall, NMI paranoid-entry +
+  SMEP/SMAP, fair co-scheduling, fatal ring-3 faults). Cosmetic: all 6 `function_casts_as_integer`
+  lints rewritten to `fn as *const () as …`; warnings 13→8 (rest are forward-scaffolding dead code).
 
 ## Status (Phase 2: ring-3 userspace making real cap_invoke syscalls)
 - ✅ **`syscall`/`sysret` + ring 3 + first userspace `cap_invoke`.** `syscall.rs` arms the
@@ -171,9 +197,10 @@ backstop. Building keystone's own page tables is now OPTIONAL polish, not a bloc
 
 ## Roadmap (Phase 2 underway)
 APIC timer ✅ → preemptive round-robin scheduler ✅ → EDF policy + time-caps ✅ →
-ring 3 + syscall + first userspace cap_invoke ✅ → **portal IPC (endpoints + notify caps)
-+ per-domain CapTables — NEXT** → crash-only domain supervision → Phase 3 (zero-kernel I/O +
-object store) →
+ring 3 + syscall + first userspace cap_invoke ✅ → ring-3 hardening (M_FREE gate) ✅ →
+per-domain CapTables + Notification async IPC ✅ (step 4a) → **portal IPC endpoints (sync
+rendezvous) + scheduler block/wake + 2nd ring-3 task — NEXT (step 4b, see docs/PORTAL_IPC.md)**
+→ crash-only domain supervision → Phase 3 (zero-kernel I/O + object store) →
 Ring-3 follow-ups (deferred, see commit): fair co-scheduling (round-robin on equal EDF
 deadlines — currently lowest-index wins, so a co-scheduled shorter-period task starves the
 user task; demo runs the ring-3 task solo), return a Memory CPtr not a raw frame number to
