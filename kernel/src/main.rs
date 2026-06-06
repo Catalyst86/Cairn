@@ -231,44 +231,95 @@ unsafe extern "C" fn kmain_main() -> ! {
     // periodic timer, and enable interrupts. The naked timer ISR round-robins the
     // tasks on every tick (round-robin now; EDF policy next). Each demo task prints
     // once per time it is resumed, so interleaved output proves real preemption.
-    if apic::init_timer(hhdm_offset, 10_000_000) {
+    if apic::init_timer(hhdm_offset) {
         sched::init();
-        let a = sched::spawn(task_a);
-        let b = sched::spawn(task_b);
-        serial_println!("scheduler: boot thread = task 0; spawned A={} B={}", a, b);
-        serial_println!("enabling preemption (round-robin on the timer tick)");
+        // "Time is a capability" (DESIGN.md pillar 6): each periodic task is admitted
+        // to the EDF run queue ONLY by presenting a live TimeSlice capability, validated
+        // through verified cap-core. Coprime periods (2/5/13 ms) so the EDF schedule
+        // can't trivially alias a round-robin one; under EDF the shorter-period task
+        // gets proportionally more CPU (~1/T), which round-robin would split evenly.
+        let demo: [(&str, extern "C" fn() -> !, u64); 3] = [
+            ("fast", task_fast, 2_000_000),
+            ("med", task_med, 5_000_000),
+            ("slow", task_slow, 13_000_000),
+        ];
+        let mut admitted = 0u32;
+        for (name, entry, period) in demo {
+            match capspace::mint_timeslice() {
+                Some(cptr) => match sched::admit(entry, cptr, period, period, period / 4) {
+                    Some(i) => {
+                        admitted += 1;
+                        serial_println!(
+                            "EDF: admitted {} (T={}ms) as task {} via TimeSlice cptr={}",
+                            name,
+                            period / 1_000_000,
+                            i,
+                            cptr
+                        );
+                    }
+                    None => serial_println!("EDF: admit({}) failed (table full / bad cap)", name),
+                },
+                None => serial_println!("EDF: mint_timeslice failed for {}", name),
+            }
+        }
+        // Capability gate + live O(1) revocation (verified invariant I2): a TimeSlice
+        // cap that has been revoked is denied admission.
+        if let Some(c) = capspace::mint_timeslice() {
+            let _ = capspace::revoke_timeslice(c);
+            serial_println!(
+                "EDF: admission with a REVOKED TimeSlice cap => {:?}",
+                capspace::admit_check(c)
+            );
+        }
+        serial_println!(
+            "scheduler: idle=task0 + {} periodic tasks; enabling EDF preemption",
+            admitted
+        );
         x86_64::instructions::interrupts::enable(); // sti
     } else {
         serial_println!("timer unavailable — no preemption");
     }
 
-    // Boot thread (task 0) idles; the timer rotates among task 0/A/B.
+    // Boot thread (task 0) is the idle task; EDF runs fast/med/slow by deadline.
     hcf();
 }
 
-/// Demo kernel task: a busy loop that notices each time the scheduler resumes it
-/// (the global tick advanced while it was descheduled) and prints — throttled to
-/// the first few + every 50th run so interleaved A/B output proves timer-driven
-/// preemption without flooding the log.
-extern "C" fn task_a() -> ! {
-    demo_task("task A")
+/// EDF demo tasks: busy loops that count the ticks they are scheduled for (the
+/// global tick advanced while running) and print throttled. Under EDF the counts
+/// diverge by period (fast >> med >> slow) — round-robin would keep them ~equal.
+extern "C" fn task_fast() -> ! {
+    demo_task("fast")
 }
 
-extern "C" fn task_b() -> ! {
-    demo_task("task B")
+extern "C" fn task_med() -> ! {
+    demo_task("med")
+}
+
+extern "C" fn task_slow() -> ! {
+    demo_task("slow")
 }
 
 fn demo_task(name: &str) -> ! {
     use core::sync::atomic::Ordering;
-    let mut last = 0u64;
-    let mut runs = 0u64;
+    let mut last_tick = 0u64;
+    let mut runs = 0u64; // ticks this task was scheduled (its CPU share)
+    let mut next_report_ms = 0u64;
     loop {
         let t = apic::TICKS.load(Ordering::Relaxed);
-        if t != last {
-            last = t;
+        if t != last_tick {
+            last_tick = t;
             runs += 1;
-            if runs <= 3 || runs % 50 == 0 {
-                serial_println!("[{}] resumed (run {}, tick {})", name, runs, t);
+            // Time-throttled report (~once / 2 s of guest time) so all three tasks
+            // print at a comparable rate despite very different CPU shares.
+            if t >= next_report_ms {
+                next_report_ms = t + 2000;
+                serial_println!(
+                    "[{}] {} of {} ms scheduled (~{}% cpu)",
+                    name,
+                    runs,
+                    t,
+                    runs.saturating_mul(100) / t.max(1)
+                );
             }
         }
     }

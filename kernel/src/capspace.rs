@@ -13,6 +13,10 @@ use spin::{Mutex, Once};
 pub const M_ALLOC: u16 = 1;
 pub const M_FREE: u16 = 2;
 
+/// Method id used to validate a TimeSlice capability at admission (kernel-side,
+/// like M_ALLOC — not part of cap-core).
+pub const M_GRANT_TIME: u16 = 1;
+
 /// Global ObjectTable (lazily initialized because ObjectTable::new is not const).
 static OBJECTS: Once<Mutex<ObjectTable>> = Once::new();
 
@@ -122,4 +126,39 @@ pub fn demo_revoke_then_invoke(cptr: u16) -> Status {
     // The original cptr is now invalid per the epoch check inside verified invoke/lookup.
     let (st, _) = cap_invoke(cptr, M_ALLOC, 0);
     st
+}
+
+/// Create a TimeSlice object and mint an INVOKE capability for it in ROOT_CAPS.
+/// Returns the CPtr. "Time is a capability": holding this cap is what admits a task
+/// to the EDF run queue (see sched::admit). Deadline/period numbers are NOT stored in
+/// the cap (the 128-bit layout is frozen) — they pass as plain args to sched::admit.
+pub fn mint_timeslice() -> Option<u16> {
+    let objs = objects();
+    let caps = root_caps();
+    let mut objects_g = objs.lock();
+    let mut caps_g = caps.lock();
+    let object_id = objects_g.create_object(ObjectKind::TimeSlice)?;
+    caps_g.mint(&*objects_g, object_id, Rights::INVOKE, 0).ok()
+}
+
+/// Admission gate: the cap at `cptr` must validate via the VERIFIED CapTable::invoke
+/// (type == TimeSlice, live epoch, INVOKE right). A revoked cap fails with ErrRevoked.
+pub fn admit_check(cptr: u16) -> Status {
+    let objects_g = objects().lock();
+    let caps_g = root_caps().lock();
+    caps_g.invoke(&*objects_g, cptr, M_GRANT_TIME, Rights::INVOKE)
+}
+
+/// Revoke a TimeSlice cap's object (epoch bump) — for the live revocation demo.
+pub fn revoke_timeslice(cptr: u16) -> Status {
+    let object_id = {
+        let objects_g = objects().lock();
+        let caps_g = root_caps().lock();
+        match caps_g.lookup(cptr, &*objects_g) {
+            Ok(entry) => entry.object_id,
+            Err(st) => return st,
+        }
+    };
+    let mut objects_g = objects().lock();
+    objects_g.revoke(object_id)
 }

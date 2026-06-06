@@ -4,7 +4,21 @@
 Cairn is a from-scratch, capability-based OS for James's HPE ProLiant x86-64 server,
 built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\Desktop\Cairn`.
 
-## Status (Phase 2: preemptive multitasking running)
+## Status (Phase 2: EDF scheduler with time-capabilities running)
+- ✅ **EDF scheduler + time-capabilities (DESIGN.md pillar 6).** `sched.rs` now selects
+  the earliest-deadline runnable task (`pick_next`) off **calibrated real-time deadlines**;
+  `apic.rs` calibrates the APIC timer against PIT channel 2 to a **1 ms tick** (`TICK_NS`).
+  Tasks are **admitted only by presenting a live `TimeSlice` capability** (`capspace::{mint_timeslice,
+  admit_check,revoke_timeslice}` over *unchanged* verified cap-core — `sched::admit` gates on it).
+  Verified in QEMU: `APIC calibrated: ~62k ticks/ms`; 3 periodic tasks (T=2/5/13 ms) admitted;
+  a **revoked TimeSlice cap is denied admission (`ErrRevoked`** — live I2); steady CPU share
+  **fast 86% / med 10% / slow 3%** (deadline-ordered, ≠ round-robin's ~33/33/33). Built with
+  Grok (greenfield calibration + EDF data/policy + cap gate) + Claude (schedule_tick wiring,
+  admit, verify). Then **adversarially reviewed** (4-dimension find→verify workflow) and 5
+  latent defects fixed: new-task + ISR stack-alignment (SysV RSP%16==8), EDF idle-floor
+  starvation, deadline over-spacing for D>T, calibration timeout/fallback, and removal of the
+  EDF-incompatible `spawn`. Context-switch frame layout unchanged; the ISR gained one
+  `and rsp,-16` alignment instruction.
 - ✅ **Preemptive round-robin scheduler.** `kernel/src/sched.rs`: ring-0 kernel tasks
   with per-task stacks, context switch via a **naked timer ISR** (saves full register
   set, calls `schedule_tick` to pick the next task, `iretq`s into it). Boot registers the
@@ -128,11 +142,13 @@ backstop. Building keystone's own page tables is now OPTIONAL polish, not a bloc
   (later) the real-hardware loop, keeps proofs green, builds the management-plane UI.
 
 ## Roadmap (Phase 2 underway)
-APIC timer ✅ → preemptive round-robin scheduler ✅ → **EDF policy + time-caps — NEXT,
-Grok's lane** (swap `sched::pick_next` for deadline ordering; needs timer calibration for
-real deadline units; tie a CPU-time capability to each runnable task) → `syscall`/`sysret`
-+ ring 3 + first userspace domain doing a real cap_invoke → portal IPC → Phase 3
-(zero-kernel I/O + object store) →
+APIC timer ✅ → preemptive round-robin scheduler ✅ → EDF policy + time-caps ✅ →
+**`syscall`/`sysret` + ring 3 + first userspace domain doing a real cap_invoke — NEXT**
+→ portal IPC → Phase 3 (zero-kernel I/O + object store) →
+Follow-ups deferred from EDF: per-task budget *enforcement* (preempt on overrun; v0 only
+accounts), deadline-miss policy beyond finish-late, calibration accuracy on real HW,
+admission utilization check (Σ Cᵢ/Tᵢ≤1), and a way to revoke an *already-admitted* task's
+TimeSlice without cap-core in the ISR hot path.
 Phase 4 (network-boot onto the real HPE ProLiant via James's existing iPXE server; see the
 `studio-server-access` memory) → Phase 5 (confidential boot + beautiful management plane).
 Keep adding Kani proofs per component; finish the `frame-alloc` proofs. Building keystone's
