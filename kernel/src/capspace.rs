@@ -5,7 +5,7 @@
 //!
 //! This module is the wiring layer only; cap-core itself is never modified here.
 
-use cap_core::capability::{CapEntry, ObjectKind, Rights};
+use cap_core::capability::{ObjectKind, Rights};
 use cap_core::table::{CapTable, ObjectTable, Status};
 use spin::{Mutex, Once};
 
@@ -91,9 +91,18 @@ pub fn cap_invoke(cptr: u16, method: u16, arg: u64) -> (Status, u64) {
             Some(frame) => (Status::Ok, frame),
             None => (Status::ErrRights, 0), // OOM surfaced as ErrRights per spec
         },
+        // M_FREE is intentionally NOT honored in v0. `arg` is an untrusted frame
+        // number and there is no per-frame ownership tracking yet, so freeing it
+        // would let a caller return a frame it never owned (or double-free) into the
+        // allocator and later re-`M_ALLOC` a kernel-owned frame straight into its own
+        // address space — a privilege escalation. Reachable from ring 3 today (the
+        // syscall path forwards method+arg0 verbatim), so we refuse rather than defer
+        // silently. A safe free requires M_ALLOC to hand back a Memory *capability*
+        // (not a raw frame number) the kernel can ownership-check at free time — the
+        // "return a Memory CPtr, not a raw frame" roadmap item.
         (ObjectKind::Memory, M_FREE) => {
-            crate::memory::deallocate_frame(arg);
-            (Status::Ok, 0)
+            let _ = arg; // untrusted; deliberately not passed to the allocator
+            (Status::ErrMethod, 0)
         }
         _ => (Status::ErrMethod, 0),
     }

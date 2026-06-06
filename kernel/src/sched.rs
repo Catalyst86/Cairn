@@ -137,7 +137,7 @@ unsafe fn build_task_frame_inner(
 /// Ring-0 task frame (runs on its own kernel stack). Delegates to the shared builder
 /// so the 20-u64 layout is byte-identical for ring-0 and ring-3 tasks.
 unsafe fn build_task_frame(i: usize, entry: extern "C" fn() -> !) -> u64 {
-    build_task_frame_inner(i, entry as usize as u64, false, 0, 0)
+    build_task_frame_inner(i, entry as *const () as u64, false, 0, 0)
 }
 
 /// 16-aligned top of task `i`'s kernel stack (its rsp0 + ring-0 run stack).

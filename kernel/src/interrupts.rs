@@ -44,7 +44,7 @@ pub fn init_idt() {
         // spurious handler keeps a stray APIC spurious IRQ from becoming a #GP.
         unsafe {
             idt[crate::apic::TIMER_VECTOR].set_handler_addr(x86_64::VirtAddr::new(
-                crate::sched::timer_isr as usize as u64,
+                crate::sched::timer_isr as *const () as u64,
             ));
         }
         idt[crate::apic::SPURIOUS_VECTOR].set_handler_fn(spurious_interrupt_handler);

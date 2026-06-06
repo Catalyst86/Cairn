@@ -69,7 +69,7 @@ pub fn init() {
     // LSTAR: the entry RIP. SFMASK: clear IF (atomic entry — most important bit),
     // DF (SysV string ABI), TF (no single-step into kernel), AC (defeat a user
     // AC=1 SMAP-bypass), NT (defensive).
-    LStar::write(VirtAddr::new(syscall_entry as usize as u64));
+    LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
     SFMask::write(
         RFlags::INTERRUPT_FLAG
             | RFlags::DIRECTION_FLAG
@@ -97,7 +97,7 @@ pub fn init() {
         uss,
         kcs,
         kss,
-        syscall_entry as usize as u64
+        syscall_entry as *const () as u64
     );
 }
 

@@ -11,8 +11,8 @@
 
 use crate::paging::map_user_page;
 
-/// The ring-3 demo blob. Compiled position-independent; copied (not executed)
-/// from the kernel image into a user-mapped executable page.
+// The ring-3 demo blob. Compiled position-independent; copied (not executed)
+// from the kernel image into a user-mapped executable page.
 core::arch::global_asm!(
     ".global user_main",
     ".p2align 4",
@@ -63,7 +63,7 @@ pub fn setup_user_demo(hhdm: u64) -> Option<(u64, u64)> {
     // Stack page: USER | PRESENT | WRITABLE | NO_EXECUTE
     let _stack_fnum = map_user_page(hhdm, 0x7f_f000, /*writable=*/ true, /*exec=*/ false)?;
 
-    let len = (user_main_end as usize) - (user_main as usize);
+    let len = (user_main_end as *const () as usize) - (user_main as *const () as usize);
 
     // SAFETY: we are writing into the freshly allocated frame that backs the
     // user code page. We use the kernel HHDM alias (writable from our CPL0 view)

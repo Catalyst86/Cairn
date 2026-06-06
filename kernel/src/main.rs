@@ -232,6 +232,11 @@ unsafe extern "C" fn kmain_main() -> ! {
             serial_println!("cap_invoke(ALLOC,0) => {:?} frame={:#x}", s1, f1 * 4096);
             let (s2, f2) = capspace::cap_invoke(cptr, capspace::M_ALLOC, 0);
             serial_println!("cap_invoke(ALLOC,0) => {:?} frame={:#x}", s2, f2 * 4096);
+            // Security gate: an untrusted M_FREE of an arbitrary frame must be refused
+            // (no per-frame ownership tracking in v0), so a ring-3 caller cannot return
+            // a kernel-owned frame into the allocator and re-alloc it. Expect ErrMethod.
+            let (fs, _) = capspace::cap_invoke(cptr, capspace::M_FREE, 0x100 /* kernel frame */);
+            serial_println!("cap_invoke(M_FREE, 0x100) => {:?} (refused: no ownership tracking)", fs);
             let rs = capspace::demo_revoke_then_invoke(cptr);
             serial_println!("demo_revoke_then_invoke => {:?}", rs);
         }
