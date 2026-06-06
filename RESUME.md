@@ -13,22 +13,40 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    rendezvous (`ep: domain2 E_RECV resumed … recv_cptr=3`, MOVE proof `cptr=1 => status=1`) plus
    the `perdomain:`/`notify:`/`GRANT_CAP gate` lines — **no panic/halt** anywhere (≈66 serial
    lines: 3 terminations, 2 restarts).
-2. **Phase 2 is COMPLETE** (domains, EDF, portal IPC, crash-only supervision + restart). The
-   Roadmap's major next is **Phase 3 — zero-kernel I/O + object store:** PCIe enum, virtio-blk/
-   net, direct queue mapping, a log-structured object store + extent caps; objects survive
-   reboot. Big, greenfield (good Claude×Grok split). Start with a design panel + a thin vertical
-   slice (e.g. virtio-blk read/write of one extent via a DeviceQueue cap mapped into a domain).
-   - **Or small polish before Phase 3** (all in `docs/CRASH_ONLY.md` / `docs/PORTAL_IPC.md`
-     "deferred"): survivor-liveness scrub (a survivor parked waiting for a dead task blocks
-     forever — needs endpoint peer-tracking / IPC timeouts); per-domain frame+object reclamation
-     on death (currently bounded-leak); blocking `N_WAIT`; multi-waiter endpoint queues.
+2. **Phase 3 is UNDERWAY** (zero-kernel I/O + object store; architected in `docs/PHASE3.md`).
+   **INC1 (PCI enumeration) ✅ DONE** (`pci.rs`). **NEXT = INC2: virtio-blk MVP** (kernel-side,
+   polled): add an idempotent `map_mmio_range` (translate-first like `map_one_page` — `map_mmio`
+   false-fails on already-mapped, and virtio cfg windows share pages); walk the virtio PCI
+   capability list (cap id 0x09) and map the cfg windows off `bar4` (mmio64 @0xfe000000, size
+   0x4000) / `bar1`; negotiate modern virtio-1.0 (+`VIRTIO_BLK_F_FLUSH`); set up ONE split
+   virtqueue from `allocate_frame`'d frames (program queue/descriptor addrs as RAW guest-phys =
+   `frame*4096`, touch rings via HHDM — the #1 footgun); do a `VIRTIO_BLK_T_IN` read of LBA0 and
+   poll `used.idx` with an apic-style anti-hang guard. **Proof:** print the pre-seeded sector-0
+   magic `CAIRN-DISK-SECTOR-0-MAGIC-v0`. Full INC2..INC7 roadmap (→ "objects survive reboot" at
+   INC6, → zero-kernel DeviceQueue at INC7) + the DMA trust boundary + crash-consistency design
+   are in `docs/PHASE3.md`. cap-core stays byte-unchanged (Extent=8/DeviceQueue=9 already exist).
+   - **Or small Phase-2 polish first** (`docs/CRASH_ONLY.md`/`PORTAL_IPC.md` "deferred"):
+     survivor-liveness scrub, per-domain frame reclamation on death, blocking `N_WAIT`,
+     multi-waiter endpoints.
 3. **cap-core stays byte-unchanged** (the regression gate; `git diff HEAD -- crates/` must be
    empty). NOTE: `kani-proofs.sh` HANGS on the frame-alloc proofs (a prior session left stale
    `cbmc` running — kill any `cbmc`/`cargo-kani`/`kani-driver` by NAME first: `pkill -9 cbmc`,
    NOT `-f` which self-matches the kill command). cap-core's 4 proofs already pass; to re-confirm
    run ONLY `cargo kani -p cap-core --features kani`. At handoff the last FEATURE commit is
-   crash-only RESTART `a1b37bf` (HEAD itself is the RESUME-update commit after it; run
-   `git log --oneline -12`).
+   Phase 3 INC1 (PCI enum) `4218ace` (HEAD is the RESUME-update commit after it; run
+   `git log --oneline -14`).
+
+## Status (Phase 3: zero-kernel I/O + object store — UNDERWAY) 🚧
+- ✅ **INC1 — PCI bus enumeration** (commit `4218ace`; `pci.rs`, `docs/PHASE3.md`). Architected
+  via a judged 3-way design panel. Legacy `0xCF8/0xCFC` config access (q35 root bus); `cfg_read32`
+  /`cfg_write32`, BAR decode+size (32/64-bit + I/O via the all-ones probe, IRQs off), `scan()`
+  over bus 0. **Verified in QEMU:** host bridge (0x8086:0x29c0), VGA, e1000, **virtio-blk modern
+  `0x1af4:0x1042`** (bar4 mmio64 @0xfe000000 size 0x4000 — the cfg window INC2 maps), AHCI, SMBus;
+  correct BAR sizes; Phase-2 boot intact; no faults. The QEMU virtio-blk disk + `disable-legacy=on`
+  are wired in `C:\WSL\cairn-go-kernel.sh` (persistent `/root/cairn-disk.img`, magic sector 0).
+- 🚧 **NEXT = INC2 virtio-blk MVP** then INC3..INC7 → "objects survive reboot" (INC6) → zero-kernel
+  DeviceQueue grant (INC7). Architecture, cap-mapping (Extent=8/DeviceQueue=9, cap-core unchanged),
+  DMA trust boundary (no IOMMU → trusted driver domain), and crash-consistency: `docs/PHASE3.md`.
 
 ## Status (Phase 2: crash-only domain supervision + restart) ✅
 - ✅ **Restart / self-healing** (commit `a1b37bf`; `supervisor.rs`): `terminate_current` calls
@@ -272,7 +290,9 @@ per-domain CapTables + Notification async IPC ✅ (step 4a) → portal IPC endpo
 rendezvous) + scheduler block/wake + cap-transfer + 2nd ring-3 task ✅ (step 4b) →
 crash-only domain supervision (ring-3 fault terminates the domain, not the kernel) ✅ →
 crash-only restart / self-healing (supervisor re-admits under a budget) ✅ (Phase 2 COMPLETE) →
-**Phase 3 — zero-kernel I/O + object store (PCIe/virtio + extent caps) — NEXT** →
+**Phase 3 — zero-kernel I/O + object store: PCI enum ✅ (INC1) → virtio-blk MVP (INC2, NEXT) →
+block layer → Cairnlog store → Extent caps → objects-survive-reboot (INC6) → DeviceQueue
+zero-kernel grant (INC7); see docs/PHASE3.md** →
 Ring-3 follow-ups (deferred, see commits): fair co-scheduling (the demo now co-schedules
 faulter+client+server across domains and works, but equal EDF deadlines are still broken by
 lowest-index — no round-robin among equal deadlines), return a Memory CPtr (not a raw frame) to
