@@ -62,9 +62,11 @@ pub const CPTR_NONE: u16 = crate::syscall::CPTR_NULL as u16;
 /// like M_ALLOC — not part of cap-core).
 pub const M_GRANT_TIME: u16 = 1;
 
-/// Number of protection domains (one CapTable each). Matches `sched::MAX_TASKS`
-/// for now (task index == domain id); domain 0 is the root/kernel domain.
-pub const MAX_DOMAINS: usize = 4;
+/// Number of protection domains (one CapTable each). Domain 0 is the root/kernel
+/// domain; the rest are assigned to ring-3 tasks (domain id is independent of task
+/// index). Fully used by the current demo: 0=root, 1=client, 2=server, 3=transient
+/// GRANT_CAP-negative-test domain, 4=crash-only faulter. Bump when adding domains.
+pub const MAX_DOMAINS: usize = 5;
 
 /// Global ObjectTable (shared object namespace; lazily initialized — proven path).
 static OBJECTS: Once<Mutex<ObjectTable>> = Once::new();
@@ -540,6 +542,35 @@ fn do_cap_transfer(src_dom: usize, src_cptr: u16, dst_dom: usize) -> Result<u16,
             Ok(dst_cptr)
         }
         Err(e) => Err(e), // no mutation occurred (delegate is all-or-nothing)
+    }
+}
+
+/// Reap a terminated domain (crash-only supervision): **revoke its authority** by
+/// clearing its CapTable — every CPtr it held vanishes (the underlying objects persist
+/// for whoever else holds caps to them, so this revokes only the dead domain, not the
+/// shared object) — and **scrub every endpoint** where the dead task was the parked
+/// peer, so a surviving partner never rendezvous-wakes a dead task. Called from
+/// `sched::terminate_current` with interrupts off on a single CPU.
+///
+/// NOTE (v0 liveness gap): the scrub is one-directional — it clears slots the DEAD task
+/// was parked on. A SURVIVOR already parked *waiting for* the dead task (its slot's
+/// `peer_task` is the survivor's own index) is NOT woken and would block until a (now
+/// impossible) partner arrives. Closing this needs endpoint peer-tracking / IPC timeouts
+/// / domain restart — deferred to 4c (see docs/CRASH_ONLY.md). The current demo's faulter
+/// is no domain's endpoint partner, so it is not exercised.
+pub fn reap_domain(domain: u16, task_idx: u16) {
+    let d = domain as usize;
+    // SAFETY: single-CPU, IRQs off; raw access to DOMAINS/ENDPOINTS, no lock held.
+    unsafe {
+        if d < MAX_DOMAINS {
+            (*core::ptr::addr_of_mut!(DOMAINS)).tables[d] = EMPTY_TABLE;
+        }
+        let eps = &mut *core::ptr::addr_of_mut!(ENDPOINTS);
+        for slot in eps.iter_mut() {
+            if slot.state != EpState::Idle && slot.peer_task == task_idx {
+                *slot = EP_EMPTY;
+            }
+        }
     }
 }
 

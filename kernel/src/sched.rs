@@ -21,7 +21,7 @@
 use core::arch::naked_asm;
 use core::sync::atomic::Ordering;
 
-const MAX_TASKS: usize = 4;
+const MAX_TASKS: usize = 5;
 const TASK_STACK_SIZE: usize = 64 * 1024; // 64 KiB per spawned task
 
 #[derive(Clone, Copy)]
@@ -485,6 +485,15 @@ pub fn current_task() -> usize {
     unsafe { (*core::ptr::addr_of!(SCHED)).current }
 }
 
+/// Protection-domain id of the currently-running task (diagnostics for fault handlers).
+pub fn current_domain_id() -> u16 {
+    // SAFETY: single-CPU, IRQs off; scalar reads.
+    unsafe {
+        let s = &*core::ptr::addr_of!(SCHED);
+        s.tasks[s.current].domain
+    }
+}
+
 /// Read the IPC result staged for task `i` by its waker (status, reply, reply_cptr).
 pub fn take_ipc_result(i: usize) -> (u64, u64, u16) {
     if i >= MAX_TASKS {
@@ -494,6 +503,68 @@ pub fn take_ipc_result(i: usize) -> (u64, u64, u16) {
     unsafe {
         let t = &(*core::ptr::addr_of!(SCHED)).tasks[i];
         (t.ipc_status, t.ipc_reply, t.ipc_reply_cptr)
+    }
+}
+
+// ---------------- crash-only termination (domain supervision) ----------------
+//
+// A ring-3 fault terminates just that task; the kernel and other domains live on. The
+// faulting task is ABANDONED (not saved) and we switch into the next runnable task.
+// `jump_to_task` is the restore HALF of `block_and_switch` with NO swapgs: a ring-3
+// exception enters with GS=user(0) (exceptions don't auto-swapgs) and IF=0 (interrupt
+// gate), and every switch target expects active GS=user(0) (ring3/idle run there; a
+// 4b-blocked task re-swaps at its resume_point) — so the GS-neutral invariant holds.
+
+/// Load `next_rsp` and restore that task via the proven 15-pop + iretq tail. Never
+/// returns (the caller's — the dead task's — context is discarded).
+///
+/// SAFETY: called only from `terminate_current` with IRQs off, single CPU, GS=user(0)
+/// (post ring-3 exception), and `next_rsp` a valid saved 20-u64 context.
+#[unsafe(naked)]
+unsafe extern "C" fn jump_to_task(next_rsp: u64) -> ! {
+    naked_asm!(
+        "mov rsp, rdi", // rdi = next_rsp; discard the faulted task's stack entirely
+        "pop r15", "pop r14", "pop r13", "pop r12", "pop r11", "pop r10", "pop r9",
+        "pop r8", "pop rbp", "pop rdi", "pop rsi", "pop rdx", "pop rcx", "pop rbx",
+        "pop rax",
+        "iretq", // GS already user(0) — no swapgs needed (see module note above)
+    )
+}
+
+/// Terminate the currently-running (faulted) ring-3 task and switch to the earliest-
+/// deadline runnable peer (idle floor guarantees a choice). Frees the task slot,
+/// **revokes the dead domain's authority** + scrubs its endpoint parking
+/// (`capspace::reap_domain`), then jumps into the next task — NEVER returning to the
+/// faulting instruction. Call ONLY for a ring-3 fault (GS=user(0), IF=0).
+pub fn terminate_current() -> ! {
+    let sched = core::ptr::addr_of_mut!(SCHED);
+    // SAFETY: single-CPU, IRQs off (interrupt-gate handler); raw access, no &mut across
+    // the asm switch; the dead task is discarded so nothing is saved for it.
+    unsafe {
+        let cur = (*sched).current;
+        let domain = (*sched).tasks[cur].domain;
+
+        // Free the slot so pick_next/roll_deadlines skip it.
+        (*sched).tasks[cur].present = false;
+        (*sched).tasks[cur].runnable = false;
+        (*sched).tasks[cur].blocked = false;
+        if (*sched).num > 0 {
+            (*sched).num -= 1;
+        }
+
+        // Revoke the dead domain's caps (clear its CapTable) and scrub any endpoint
+        // where it was the parked peer (so no survivor wakes a dead task).
+        crate::capspace::reap_domain(domain, cur as u16);
+
+        // Choose the next runnable task and switch into it (idle is the floor).
+        let now = now_ns();
+        roll_deadlines(&mut *sched, now);
+        let n = pick_next(&*sched);
+        (*sched).current = n;
+        set_kernel_stack((*sched).tasks[n].kstack_top);
+        crate::capspace::set_current_domain((*sched).tasks[n].domain);
+        let next = (*sched).tasks[n].rsp;
+        jump_to_task(next)
     }
 }
 

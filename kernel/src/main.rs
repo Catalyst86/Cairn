@@ -291,6 +291,29 @@ unsafe extern "C" fn kmain_main() -> ! {
     if apic::init_timer(hhdm_offset) {
         sched::init();
 
+        // --- crash-only supervision demo: a faulter domain that deliberately #UDs ---
+        // Admitted FIRST (lowest task index ⇒ runs first), so it M_ALLOCs then faults
+        // EARLY; the endpoint rendezvous below then completes normally — proving the
+        // kernel survived the fault and isolated it to the one domain.
+        const FAULT_DOMAIN: usize = 4;
+        let fault_mem = capspace::init_root()
+            .and_then(|m| capspace::delegate_from_root(FAULT_DOMAIN, m, Rights::INVOKE, 0));
+        let fault_blob = user::setup_user_task(
+            hhdm_offset, 0x42_0000, 0x7d_f000, user::faulter_main, user::faulter_main_end,
+        );
+        match (fault_mem, fault_blob, capspace::mint_timeslice()) {
+            (Some(fm), Some((fe, fs)), Some(ft)) => {
+                match sched::admit_user(fe, fs, fm, ft, FAULT_DOMAIN as u16, 5_000_000, 5_000_000, 1_000_000) {
+                    Some(i) => serial_println!(
+                        "crash-only: admitted faulter (domain{}) as task {}; mem_cptr={} (will M_ALLOC then #UD)",
+                        FAULT_DOMAIN, i, fm
+                    ),
+                    None => serial_println!("crash-only: faulter admit failed"),
+                }
+            }
+            _ => serial_println!("crash-only: faulter setup incomplete"),
+        }
+
         const CLIENT_DOMAIN: usize = 1;
         const SERVER_DOMAIN: usize = 2;
 

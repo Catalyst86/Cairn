@@ -69,6 +69,23 @@ core::arch::global_asm!(
     "    jmp 2b",              // loop: next E_RECV blocks forever (no more senders)
     ".global server_main_end",
     "server_main_end:",
+    // ---- faulter (own domain): do one real syscall, then deliberately fault (#UD) ----
+    // Proves crash-only supervision: the kernel terminates JUST this domain and lives on.
+    ".global faulter_main",
+    ".p2align 4",
+    "faulter_main:",
+    "    mov rbx, rdi",        // rbx = its Memory cptr (slot 0 in its domain)
+    "    mov rax, 1",          // SYS_CAP_INVOKE
+    "    mov rdi, rbx",        // cptr = Memory cap
+    "    mov rsi, 1",          // method = M_ALLOC (proves it ran in ring 3)
+    "    xor edx, edx",
+    "    xor r10d, r10d",
+    "    xor r8d, r8d",
+    "    mov r9, 0xffff",      // transfer = CPTR_NULL
+    "    syscall",
+    "    ud2",                 // deliberate invalid opcode => #UD => crash-only terminate
+    ".global faulter_main_end",
+    "faulter_main_end:",
 );
 
 extern "C" {
@@ -76,6 +93,8 @@ extern "C" {
     pub fn client_main_end();
     pub fn server_main();
     pub fn server_main_end();
+    pub fn faulter_main();
+    pub fn faulter_main_end();
 }
 
 /// Map a read-only executable user code page at `code_va` and a writable NX user stack

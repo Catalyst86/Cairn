@@ -8,6 +8,7 @@
 
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::PrivilegeLevel;
 
 use crate::gdt;
 
@@ -57,6 +58,28 @@ pub fn init_idt() {
 
 // ---------------- handlers ----------------
 
+/// True if the saved frame's code segment was ring 3 — i.e. the fault was raised by a
+/// userspace task (vs a kernel bug, which stays fatal).
+#[inline]
+fn faulted_in_ring3(frame: &InterruptStackFrame) -> bool {
+    frame.code_segment.rpl() == PrivilegeLevel::Ring3
+}
+
+/// Crash-only supervision: a ring-3 fault terminates just that domain (revoke its caps,
+/// scrub its endpoint parking, reschedule) — the kernel and all other domains live on.
+/// Never returns (switches into the next runnable task). Call ONLY for a ring-3 fault.
+fn terminate_ring3(kind: &str, frame: &InterruptStackFrame, detail: u64) -> ! {
+    crate::serial_println!(
+        "domain {} (task {}) terminated: {} rip={:#x} detail={:#x} — crash-only: kernel survives",
+        crate::sched::current_domain_id(),
+        crate::sched::current_task(),
+        kind,
+        frame.instruction_pointer.as_u64(),
+        detail
+    );
+    crate::sched::terminate_current()
+}
+
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     crate::serial_println!("EXCEPTION: BREAKPOINT");
     crate::serial_println!("{:#?}", stack_frame);
@@ -91,8 +114,16 @@ extern "x86-interrupt" fn page_fault_handler(
     // Stack-overflow tripwire: a fault inside the unmapped guard page below the
     // kernel stack means we ran out of stack. Report loudly and halt — do NOT fall
     // through to the on-demand mapper (which would map the guard and mask the bug).
+    //
+    // Gated on a SUPERVISOR-mode fault (!USER_MODE): a genuine kernel-stack overflow is
+    // always raised by the kernel (CPL=0). Without this gate a ring-3 task could simply
+    // *read* the guard VA, land CR2 in this range from a USER-mode fault, and masquerade
+    // as an overflow to halt the whole kernel — inverting crash-only into a DoS. A ring-3
+    // access to the guard instead falls through to the crash-only terminate below.
     let guard = crate::stack_guard_base();
-    if (guard..guard + 0x1000).contains(&fault_addr) {
+    if !error_code.contains(PageFaultErrorCode::USER_MODE)
+        && (guard..guard + 0x1000).contains(&fault_addr)
+    {
         crate::serial_println!("EXCEPTION: KERNEL STACK OVERFLOW");
         crate::serial_println!(
             "  hit guard page at {:#x} (kernel stack exhausted)",
@@ -105,6 +136,12 @@ extern "x86-interrupt" fn page_fault_handler(
                 core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
             }
         }
+    }
+
+    // Crash-only: a page fault raised by a ring-3 task terminates just that domain
+    // (kernel-stack overflow above is always ring-0/fatal; ring-3 never hits the guard).
+    if faulted_in_ring3(&stack_frame) {
+        terminate_ring3("#PF", &stack_frame, fault_addr);
     }
 
     // Defensive backstop: on-demand-map a *not-present* kernel higher-half page.
@@ -135,7 +172,11 @@ extern "x86-interrupt" fn general_protection_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) {
-    crate::serial_println!("EXCEPTION: GENERAL PROTECTION FAULT (error={:#x})", error_code);
+    // Crash-only: a #GP from ring 3 (e.g. a privileged instruction) terminates the task.
+    if faulted_in_ring3(&stack_frame) {
+        terminate_ring3("#GP", &stack_frame, error_code);
+    }
+    crate::serial_println!("EXCEPTION: GENERAL PROTECTION FAULT (error={:#x}) — ring 0, fatal", error_code);
     crate::serial_println!("{:#?}", stack_frame);
 
     loop {
@@ -146,7 +187,11 @@ extern "x86-interrupt" fn general_protection_handler(
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
-    crate::serial_println!("EXCEPTION: INVALID OPCODE");
+    // Crash-only: a #UD from ring 3 (e.g. ud2) terminates the task.
+    if faulted_in_ring3(&stack_frame) {
+        terminate_ring3("#UD", &stack_frame, 0);
+    }
+    crate::serial_println!("EXCEPTION: INVALID OPCODE — ring 0, fatal");
     crate::serial_println!("{:#?}", stack_frame);
 
     loop {
