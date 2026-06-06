@@ -126,7 +126,14 @@ unsafe extern "C" fn kmain() -> ! {
     // yet create page tables in HHDM-uncovered frames. The next focused task is
     // proper kernel page-table setup (build our own tables instead of patching
     // Limine's). capspace.rs + paging.rs are written, reviewed, and compile.
-    serial_println!("capspace + paging modules loaded (live cap_invoke demo pending paging rework)");
+    // --- capability self-test: DISABLED pending the paging rework. ---
+    // Root cause isolated: writing capspace's large .bss statics faults because
+    // Limine leaves the first bss page unmapped, and our on-demand mapper can't
+    // recover — reading the active L4 through the HHDM *inside the #PF handler*
+    // returns 0 even though the CPU is executing from that L4 entry (interrupt-
+    // context vs normal-context inconsistency). The fix is for keystone to build
+    // and load its OWN page tables instead of patching Limine's. See NOTES below.
+    serial_println!("capspace + paging loaded (live cap_invoke demo pending page-table rework)");
     let _ = (capspace::M_ALLOC, capspace::M_FREE);
 
     hcf();

@@ -76,7 +76,7 @@ extern "x86-interrupt" fn page_fault_handler(
     // range; map the page and retry the faulting instruction.
     if !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
         && (0xffff_ffff_8000_0000..0xffff_ffff_c000_0000).contains(&fault_addr)
-        && crate::paging::map_one_page(crate::memory::hhdm_offset(), fault_addr)
+        && crate::paging::manual_map(crate::memory::hhdm_offset(), fault_addr)
     {
         return;
     }

@@ -33,6 +33,89 @@ unsafe fn active_mapper(hhdm_offset: u64) -> OffsetPageTable<'static> {
     OffsetPageTable::new(l4, VirtAddr::new(hhdm_offset))
 }
 
+/// Diagnostic: manually walk the active page tables for `va` and print each
+/// level's entry (present / huge / physical address). Reads tables via the HHDM.
+pub fn dump_walk(hhdm: u64, va: u64) {
+    let (l4f, _) = Cr3::read();
+    let mut table = (hhdm + l4f.start_address().as_u64()) as *const u64;
+    crate::serial_println!("walk {:#x} (cr3 phys {:#x}):", va, l4f.start_address().as_u64());
+    for (lvl, shift) in [(4u32, 39u32), (3, 30), (2, 21), (1, 12)] {
+        let idx = ((va >> shift) & 0x1ff) as usize;
+        // SAFETY: reading a page-table entry through the HHDM.
+        let e = unsafe { core::ptr::read_volatile(table.add(idx)) };
+        let present = e & 1;
+        let huge = (e >> 7) & 1;
+        let phys = e & 0x000f_ffff_ffff_f000;
+        crate::serial_println!(
+            "  L{} idx={} entry={:#x} present={} huge={} phys={:#x}",
+            lvl, idx, e, present, huge, phys
+        );
+        if present == 0 {
+            crate::serial_println!("  -> NOT PRESENT at L{}", lvl);
+            return;
+        }
+        if huge == 1 {
+            crate::serial_println!("  -> HUGE at L{}", lvl);
+            return;
+        }
+        table = (hhdm + phys) as *const u64;
+    }
+    crate::serial_println!("  -> 4KiB mapped");
+}
+
+/// Map `va`'s page by adding an L1 entry to the EXISTING page-table hierarchy
+/// (the one Limine built). We walk L4/L3/L2 — which must already be present 4 KiB
+/// tables — then install a single present+writable L1 entry pointing at a fresh
+/// frame, and zero the page via its now-mapped kernel virtual address.
+///
+/// This deliberately avoids the x86_64 crate's `map_to`, which creates new
+/// intermediate tables and accesses those fresh frames through the HHDM — the
+/// operation that was faulting. Here we only ever write into a table the walk
+/// already proved reachable, and only touch the new frame via `va` (not the HHDM).
+/// Returns false (caller treats as fatal) if an intermediate level is missing or
+/// a huge page is in the way.
+pub fn manual_map(hhdm: u64, va: u64) -> bool {
+    let va = va & !0xfff;
+    let (l4f, _) = Cr3::read();
+    let mut table_phys = l4f.start_address().as_u64();
+    crate::serial_println!("  mm hhdm={:#x} cr3phys={:#x} va={:#x}", hhdm, table_phys, va);
+
+    // Walk L4 -> L3 -> L2; each must be a present, non-huge table.
+    for shift in [39u32, 30, 21] {
+        let t = (hhdm + table_phys) as *const u64;
+        let idx = ((va >> shift) & 0x1ff) as usize;
+        let e = unsafe { core::ptr::read_volatile(t.add(idx)) };
+        crate::serial_println!("  mm va={:#x} sh={} idx={} e={:#x}", va, shift, idx, e);
+        if e & 1 == 0 || (e >> 7) & 1 == 1 {
+            crate::serial_println!("  mm BAIL at sh={} (missing/huge)", shift);
+            return false;
+        }
+        table_phys = e & 0x000f_ffff_ffff_f000;
+    }
+
+    // table_phys now points at the L1 table.
+    let l1 = (hhdm + table_phys) as *mut u64;
+    let i1 = ((va >> 12) & 0x1ff) as usize;
+    let existing = unsafe { core::ptr::read_volatile(l1.add(i1)) };
+    crate::serial_println!("  mm L1 i1={} existing={:#x}", i1, existing);
+    if existing & 1 == 1 {
+        return true; // already mapped
+    }
+
+    let frame = match crate::memory::allocate_frame() {
+        Some(f) => f * 4096,
+        None => return false,
+    };
+    crate::serial_println!("  mm map {:#x} -> phys {:#x}", va, frame);
+    unsafe {
+        // present + writable
+        core::ptr::write_volatile(l1.add(i1), frame | 0x3);
+        x86_64::instructions::tlb::flush(VirtAddr::new(va));
+        core::ptr::write_bytes(va as *mut u8, 0, 4096);
+    }
+    true
+}
+
 /// Ensure the 4 KiB page containing `addr` is mapped present+writable. If it is
 /// already mapped, this is a no-op; otherwise a fresh frame is allocated, mapped,
 /// and zeroed (bss must read as zero). Returns true if the page is mapped on exit.
