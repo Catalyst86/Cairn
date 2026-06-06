@@ -33,6 +33,13 @@ struct GdtSelectors {
 
 static GDT: Once<(GlobalDescriptorTable, GdtSelectors)> = Once::new();
 
+/// Raw (code, data) segment selector values, for building task contexts in the
+/// scheduler. Panics if called before `init`.
+pub fn kernel_selectors() -> (u16, u16) {
+    let (_, sel) = GDT.get().expect("GDT not initialized");
+    (sel.code_selector.0, sel.data_selector.0)
+}
+
 /// Initialize and load the GDT + TSS. Must be called before interrupts::init_idt
 /// (so that the IST is valid when we register the #DF handler).
 pub fn init() {

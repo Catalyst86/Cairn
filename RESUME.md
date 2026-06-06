@@ -4,7 +4,15 @@
 Cairn is a from-scratch, capability-based OS for James's HPE ProLiant x86-64 server,
 built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\Desktop\Cairn`.
 
-## Status (milestone: cap_invoke LIVE; stack hardened; APIC timer ticking)
+## Status (Phase 2: preemptive multitasking running)
+- ✅ **Preemptive round-robin scheduler.** `kernel/src/sched.rs`: ring-0 kernel tasks
+  with per-task stacks, context switch via a **naked timer ISR** (saves full register
+  set, calls `schedule_tick` to pick the next task, `iretq`s into it). Boot registers the
+  idle boot thread as task 0, spawns demo tasks A + B; the APIC timer round-robins all
+  three. Verified: `[task A]`/`[task B]` interleave at ticks 1,4,7,… / 2,5,8,… (gap of 3
+  = round-robin over {boot, A, B}), 119+ ticks, no fault. Policy is trivial round-robin —
+  EDF deadline-ordering only changes `pick_next` (Grok's lane, next). Single-CPU; SCHED is
+  touched only with IRQs off (no lock — a lock would deadlock the ISR vs a preempted holder).
 - ✅ **APIC periodic timer (Phase 2 foundation).** `kernel/src/apic.rs` brings up the
   **xAPIC via MMIO** (TCG does NOT emulate x2APIC), masks the legacy PIC, and runs a
   periodic timer on vector `0x20`; the ISR bumps `apic::TICKS` + EOIs. Boot log shows
@@ -120,9 +128,11 @@ backstop. Building keystone's own page tables is now OPTIONAL polish, not a bloc
   (later) the real-hardware loop, keeps proofs green, builds the management-plane UI.
 
 ## Roadmap (Phase 2 underway)
-APIC timer ✅ → **EDF scheduler (time-caps) — NEXT, Grok's lane** (build on `apic::TICKS`;
-will need timer calibration for real deadlines) → `syscall`/`sysret` + ring 3 + first
-userspace domain doing a real cap_invoke → portal IPC → Phase 3 (zero-kernel I/O + object store) →
+APIC timer ✅ → preemptive round-robin scheduler ✅ → **EDF policy + time-caps — NEXT,
+Grok's lane** (swap `sched::pick_next` for deadline ordering; needs timer calibration for
+real deadline units; tie a CPU-time capability to each runnable task) → `syscall`/`sysret`
++ ring 3 + first userspace domain doing a real cap_invoke → portal IPC → Phase 3
+(zero-kernel I/O + object store) →
 Phase 4 (network-boot onto the real HPE ProLiant via James's existing iPXE server; see the
 `studio-server-access` memory) → Phase 5 (confidential boot + beautiful management plane).
 Keep adding Kani proofs per component; finish the `frame-alloc` proofs. Building keystone's

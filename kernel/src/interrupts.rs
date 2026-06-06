@@ -38,9 +38,15 @@ pub fn init_idt() {
         idt.general_protection_fault.set_handler_fn(general_protection_handler);
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
 
-        // Hardware interrupts (APIC). Timer drives the future scheduler; the
+        // Hardware interrupts (APIC). The timer uses the scheduler's naked ISR
+        // (raw address: it performs a context switch + iretq and must run on the
+        // interrupted task's stack, so no x86-interrupt wrapper and no IST). The
         // spurious handler keeps a stray APIC spurious IRQ from becoming a #GP.
-        idt[crate::apic::TIMER_VECTOR].set_handler_fn(timer_interrupt_handler);
+        unsafe {
+            idt[crate::apic::TIMER_VECTOR].set_handler_addr(x86_64::VirtAddr::new(
+                crate::sched::timer_isr as usize as u64,
+            ));
+        }
         idt[crate::apic::SPURIOUS_VECTOR].set_handler_fn(spurious_interrupt_handler);
 
         idt
@@ -152,16 +158,8 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
 
 // ---------------- hardware interrupts (APIC) ----------------
 
-/// Periodic APIC timer. Bumps the global tick counter and signals EOI. Output is
-/// throttled (first few + every 100th) so a fast timer doesn't flood the serial log.
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    use core::sync::atomic::Ordering;
-    let t = crate::apic::TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    if t <= 5 || t % 100 == 0 {
-        crate::serial_println!("timer tick #{}", t);
-    }
-    crate::apic::eoi();
-}
+// The periodic timer is handled by the scheduler's naked ISR (`sched::timer_isr`),
+// which ticks, EOIs, and context-switches. See sched.rs.
 
 /// APIC spurious interrupt. By spec it needs no EOI; just return.
 extern "x86-interrupt" fn spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {

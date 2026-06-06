@@ -22,6 +22,7 @@ mod interrupts;
 mod memory;
 mod paging;
 mod capspace;
+mod sched;
 mod serial;
 
 use limine::request::{HhdmRequest, MemmapRequest, StackSizeRequest};
@@ -225,17 +226,52 @@ unsafe extern "C" fn kmain_main() -> ! {
         None => serial_println!("init_root failed"),
     }
 
-    // --- Phase 2 foundation: APIC periodic timer ---
-    // Start the LAPIC timer and enable interrupts; the ISR ticks TICKS. This is
-    // the clock the EDF scheduler (next) will preempt and schedule from.
+    // --- Phase 2: preemptive multitasking off the APIC timer ---
+    // Register the boot thread as task 0, spawn two demo kernel tasks, start the
+    // periodic timer, and enable interrupts. The naked timer ISR round-robins the
+    // tasks on every tick (round-robin now; EDF policy next). Each demo task prints
+    // once per time it is resumed, so interleaved output proves real preemption.
     if apic::init_timer(hhdm_offset, 10_000_000) {
+        sched::init();
+        let a = sched::spawn(task_a);
+        let b = sched::spawn(task_b);
+        serial_println!("scheduler: boot thread = task 0; spawned A={} B={}", a, b);
+        serial_println!("enabling preemption (round-robin on the timer tick)");
         x86_64::instructions::interrupts::enable(); // sti
-        serial_println!("interrupts enabled — halting; expect periodic timer ticks");
     } else {
-        serial_println!("timer unavailable — halting without ticks");
+        serial_println!("timer unavailable — no preemption");
     }
 
+    // Boot thread (task 0) idles; the timer rotates among task 0/A/B.
     hcf();
+}
+
+/// Demo kernel task: a busy loop that notices each time the scheduler resumes it
+/// (the global tick advanced while it was descheduled) and prints — throttled to
+/// the first few + every 50th run so interleaved A/B output proves timer-driven
+/// preemption without flooding the log.
+extern "C" fn task_a() -> ! {
+    demo_task("task A")
+}
+
+extern "C" fn task_b() -> ! {
+    demo_task("task B")
+}
+
+fn demo_task(name: &str) -> ! {
+    use core::sync::atomic::Ordering;
+    let mut last = 0u64;
+    let mut runs = 0u64;
+    loop {
+        let t = apic::TICKS.load(Ordering::Relaxed);
+        if t != last {
+            last = t;
+            runs += 1;
+            if runs <= 3 || runs % 50 == 0 {
+                serial_println!("[{}] resumed (run {}, tick {})", name, runs, t);
+            }
+        }
+    }
 }
 
 #[panic_handler]
