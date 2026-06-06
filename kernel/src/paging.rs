@@ -183,6 +183,48 @@ pub fn map_mmio(hhdm_offset: u64, virt: u64, phys: u64) -> bool {
     }
 }
 
+/// Map the physical MMIO range `[phys, phys+len)` as no-cache at virt `hhdm_offset+phys`,
+/// **idempotently** (already-mapped pages are skipped — virtio's common/notify/isr/device
+/// config windows commonly share one 4 KiB page, so a naive per-window `map_mmio` would
+/// false-fail on the second). Returns the virtual base for `phys` (preserving its sub-page
+/// offset), or `None` if a mapping failed.
+///
+/// SAFETY: single-CPU early boot, IRQs off; `phys` is a device-MMIO range.
+pub fn map_mmio_range(hhdm_offset: u64, phys: u64, len: u64) -> Option<u64> {
+    if len == 0 {
+        return Some(hhdm_offset + phys);
+    }
+    let first = phys & !0xfff;
+    let last = (phys + len - 1) & !0xfff;
+    let mut mapper = unsafe { active_mapper(hhdm_offset) };
+    let mut frames = KernelFrames;
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::NO_CACHE
+        | PageTableFlags::NO_EXECUTE;
+    let mut pa = first;
+    loop {
+        let va = hhdm_offset + pa;
+        let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(va));
+        // translate-first: skip pages already mapped (shared windows / overlap).
+        if mapper.translate_page(page).is_err() {
+            let frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(PhysAddr::new(pa));
+            // SAFETY: mapping a device-MMIO page to its fixed physical frame; flushed below.
+            unsafe {
+                match mapper.map_to(page, frame, flags, &mut frames) {
+                    Ok(flush) => flush.flush(),
+                    Err(_) => return None,
+                }
+            }
+        }
+        if pa == last {
+            break;
+        }
+        pa += 0x1000;
+    }
+    Some(hhdm_offset + phys)
+}
+
 /// Ensure the 4 KiB page containing `addr` is mapped present+writable. If it is
 /// already mapped, this is a no-op; otherwise a fresh frame is allocated, mapped,
 /// and zeroed (bss must read as zero). Returns true if the page is mapped on exit.

@@ -28,6 +28,7 @@ mod serial;
 mod supervisor;
 mod syscall;
 mod user;
+mod virtio_blk;
 
 use cap_core::capability::Rights;
 use limine::request::{HhdmRequest, MemmapRequest, StackSizeRequest};
@@ -209,6 +210,9 @@ unsafe extern "C" fn kmain_main() -> ! {
     // --- Phase 3 (L0): enumerate PCI bus 0 (IRQs still off — BAR-size probe is atomic) ---
     // Discovers the virtio-blk device + its MMIO BARs (the config window the driver maps next).
     pci::scan();
+
+    // --- Phase 3 (L1): bring up the virtio-blk driver + read LBA 0 (polled, IRQs off) ---
+    virtio_blk::smoke_test(hhdm_offset);
 
     // --- self-tests (as specified) ---
 

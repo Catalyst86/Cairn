@@ -22,8 +22,9 @@ const VIRTIO_VENDOR: u16 = 0x1AF4;
 const CLASS_STORAGE: u8 = 0x01;
 
 /// Build the CF8 config address for (bus, dev, func, dword-aligned `off`).
+/// `off` is u16 so capability-list arithmetic (`cap + 16`) can't overflow (256-byte space).
 #[inline]
-fn cfg_addr(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
+fn cfg_addr(bus: u8, dev: u8, func: u8, off: u16) -> u32 {
     0x8000_0000
         | ((bus as u32) << 16)
         | ((dev as u32) << 11)
@@ -35,7 +36,7 @@ fn cfg_addr(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
 ///
 /// SAFETY: standard PCI legacy config mechanism (CF8 address latch + CFC data port).
 /// Called single-CPU with interrupts off, so the address/data pair is never interleaved.
-fn cfg_read32(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
+pub fn cfg_read32(bus: u8, dev: u8, func: u8, off: u16) -> u32 {
     unsafe {
         let mut a: Port<u32> = Port::new(CONFIG_ADDR);
         let mut d: Port<u32> = Port::new(CONFIG_DATA);
@@ -46,13 +47,57 @@ fn cfg_read32(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
 
 /// Write a 32-bit dword to PCI config space (used to size BARs).
 /// SAFETY: as [`cfg_read32`]; single-CPU, IRQs off.
-fn cfg_write32(bus: u8, dev: u8, func: u8, off: u8, val: u32) {
+fn cfg_write32(bus: u8, dev: u8, func: u8, off: u16, val: u32) {
     unsafe {
         let mut a: Port<u32> = Port::new(CONFIG_ADDR);
         let mut d: Port<u32> = Port::new(CONFIG_DATA);
         a.write(cfg_addr(bus, dev, func, off));
         d.write(val);
     }
+}
+
+/// Read a byte from config space (for the capability-list walk).
+pub fn cfg_read8(bus: u8, dev: u8, func: u8, off: u16) -> u8 {
+    (cfg_read32(bus, dev, func, off & !3) >> ((off & 3) * 8)) as u8
+}
+
+/// Locate the virtio-blk device (vendor 0x1AF4, class 0x01) on bus 0. Returns its
+/// (bus, dev, func), or None.
+pub fn find_virtio_blk() -> Option<(u8, u8, u8)> {
+    for dev in 0u8..32 {
+        for func in 0u8..8 {
+            let id = cfg_read32(0, dev, func, 0x00);
+            if (id & 0xFFFF) as u16 == VIRTIO_VENDOR
+                && ((cfg_read32(0, dev, func, 0x08) >> 24) & 0xFF) as u8 == CLASS_STORAGE
+            {
+                return Some((0, dev, func));
+            }
+        }
+    }
+    None
+}
+
+/// Read a BAR's base address (no size probe), handling 64-bit BARs. For the driver to
+/// compute the MMIO address of a virtio capability window (`bar_base + cap.offset`).
+pub fn bar_base(bus: u8, dev: u8, func: u8, i: u8) -> u64 {
+    let off: u16 = 0x10 + (i as u16) * 4;
+    let raw = cfg_read32(bus, dev, func, off);
+    if raw & 0x1 != 0 {
+        return (raw & 0xFFFF_FFFC) as u64; // I/O BAR
+    }
+    let mut base = (raw & 0xFFFF_FFF0) as u64;
+    if ((raw >> 1) & 0x3) == 0x2 {
+        base |= (cfg_read32(bus, dev, func, off + 4) as u64) << 32;
+    }
+    base
+}
+
+/// Enable Memory-Space + Bus-Master in the device's PCI command register (offset 0x04),
+/// so it responds to MMIO BAR accesses AND can issue DMA. Must run before virtio init
+/// (forgetting bus-master is the classic "device never DMAs" bug).
+pub fn enable_bus_master(bus: u8, dev: u8, func: u8) {
+    let cmd = cfg_read32(bus, dev, func, 0x04);
+    cfg_write32(bus, dev, func, 0x04, cmd | 0x6); // bit1=Memory Space, bit2=Bus Master
 }
 
 /// Decoded BAR. `size == 0` means the BAR is unimplemented (skip it).
@@ -67,7 +112,7 @@ struct Bar {
 /// write-all-ones / read-back / restore probe. Must run with IRQs off (atomic probe).
 /// A 64-bit memory BAR consumes BARs `i` and `i+1`; the caller advances by 2.
 fn bar_info(bus: u8, dev: u8, func: u8, i: u8) -> Bar {
-    let off = 0x10 + i * 4;
+    let off: u16 = 0x10 + (i as u16) * 4;
     let raw = cfg_read32(bus, dev, func, off);
     if raw == 0 {
         return Bar { base: 0, size: 0, is_io: false, is_64: false };
