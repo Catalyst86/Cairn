@@ -6,10 +6,13 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
 
 ## ⏭ Next session — start here
 1. **Confirm the clean boot** still works: `wsl.exe -d Ubuntu -- bash /mnt/c/WSL/cairn-go-kernel.sh`
-   — expect `crash-only: admitted faulter …`, the faulter's `M_ALLOC`, then `domain 4 (task 1)
-   terminated: #UD rip=0x420025 — crash-only: kernel survives`, FOLLOWED BY the full 4b endpoint
-   rendezvous (`ep: domain2 E_RECV resumed … recv_cptr=3`, MOVE proof `cptr=1 => status=1`) and
-   the `perdomain:`/`notify:`/`GRANT_CAP gate` lines — **no panic/halt** anywhere.
+   — expect the crash-only **self-healing loop**: `crash-only: admitted faulter …` → `domain 4
+   (task 1) terminated: #UD rip=0x420025 — crash-only: kernel survives` → `supervisor: RESTARTED
+   domain 4 … (1 restart(s) left)` → terminated → `RESTARTED … (0 left)` → terminated →
+   `supervisor: domain 4 reaped — restart budget exhausted`; FOLLOWED BY the full 4b endpoint
+   rendezvous (`ep: domain2 E_RECV resumed … recv_cptr=3`, MOVE proof `cptr=1 => status=1`) plus
+   the `perdomain:`/`notify:`/`GRANT_CAP gate` lines — **no panic/halt** anywhere (≈66 serial
+   lines: 3 terminations, 2 restarts).
 2. **Phase 2 is COMPLETE** (domains, EDF, portal IPC, crash-only supervision + restart). The
    Roadmap's major next is **Phase 3 — zero-kernel I/O + object store:** PCIe enum, virtio-blk/
    net, direct queue mapping, a log-structured object store + extent caps; objects survive
@@ -23,8 +26,9 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    empty). NOTE: `kani-proofs.sh` HANGS on the frame-alloc proofs (a prior session left stale
    `cbmc` running — kill any `cbmc`/`cargo-kani`/`kani-driver` by NAME first: `pkill -9 cbmc`,
    NOT `-f` which self-matches the kill command). cap-core's 4 proofs already pass; to re-confirm
-   run ONLY `cargo kani -p cap-core --features kani`. git HEAD at handoff = crash-only RESTART
-   commit `a1b37bf` (run `git log --oneline -12`).
+   run ONLY `cargo kani -p cap-core --features kani`. At handoff the last FEATURE commit is
+   crash-only RESTART `a1b37bf` (HEAD itself is the RESUME-update commit after it; run
+   `git log --oneline -12`).
 
 ## Status (Phase 2: crash-only domain supervision + restart) ✅
 - ✅ **Restart / self-healing** (commit `a1b37bf`; `supervisor.rs`): `terminate_current` calls
@@ -53,8 +57,10 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
     ring-3 task reading the guard VA can't masquerade as an overflow and halt the kernel (DoS).
     MED (documented v0 gap) — the endpoint scrub is one-directional (a survivor parked *waiting
     for* a dead task blocks forever; needs peer-tracking/timeouts/restart → 4c).
-  - **Deferred (4c):** restart/self-healing (slot+machinery ready), per-domain frame reclamation
-    on death (the faulter's frame leaks), survivor-liveness scrub. cap-core byte-unchanged.
+  - **Deferred (later):** per-domain frame/object reclamation on death (bounded-leak; tied to the
+    Memory-CPtr redesign), survivor-liveness scrub (a survivor parked *waiting for* a dead task
+    blocks forever — needs peer-tracking/timeouts). cap-core byte-unchanged. (Restart/self-healing
+    is DONE — see the block above.)
 
 ## Status (Phase 2: blocking endpoint IPC + scheduler block/wake — step 4b) ✅
 - ✅ **Synchronous Endpoint IPC across two ring-3 domains, with block/wake + cap-transfer**
@@ -162,7 +168,8 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
   `0x101000`, `demo_revoke_then_invoke => ErrRevoked` — the verified I2 epoch-revocation
   invariant running in the real kernel.
 - ✅ **The paging "map-then-unmap" bug is FIXED** (root cause + fix below).
-- ⏳ `frame-alloc` Kani proofs were still running when we paused (cap-core's 4 passed).
+- ⏳ `frame-alloc` Kani proofs are NOT confirmed — `kani-proofs.sh` HANGS on them (see the top
+  note); cap-core's 4 proofs DO pass. Re-confirm cap-core alone: `cargo kani -p cap-core --features kani`.
 
 ## THE PAGING BUG — SOLVED (was: "map-then-unmap")
 **The previous diagnosis was WRONG.** It was NOT an unmapped `.bss` tail and NOT
@@ -223,7 +230,10 @@ backstop. Building keystone's own page tables is now OPTIONAL polish, not a bloc
   (reuses the last-built `cairn.iso`; gdb output via `set logging` → `/root/cairn-gdb*.log`).
 - **Full rebuild (kernel + crates):** `.../cairn-rebuild.sh` ; **whole pipeline:** `.../cairn-go.sh`.
 - **Kani proofs:** `wsl.exe -d Ubuntu -- bash /mnt/c/WSL/kani-proofs.sh` (slow — cap-core
-  took ~26 min; runs `cargo kani -p cap-core --features kani` and `-p frame-alloc`).
+  took ~26 min; runs `cargo kani -p cap-core --features kani` and `-p frame-alloc`). **WARNING:**
+  it currently HANGS on the `frame-alloc` proofs and leaves stale `cbmc` running — for a quick
+  regression check run only `cargo kani -p cap-core --features kani`, and reap stragglers with
+  `pkill -9 cbmc` (by NAME — `-f` self-matches the kill command).
 - Filter serial output in PowerShell with `... | Select-String -Pattern "..."` (no `grep`).
 - Helper scripts in `C:\WSL\`: cairn-go-kernel.sh, cairn-rebuild.sh, cairn-go.sh,
   kani-proofs.sh, kani-setup.sh, limine-setup.sh, cairn-gdb.sh, cairn-gdb.cmds,
@@ -255,7 +265,7 @@ backstop. Building keystone's own page tables is now OPTIONAL polish, not a bloc
 - **Claude** orchestrates, reviews Grok's `unsafe`, drives the build/boot/verify loop and
   (later) the real-hardware loop, keeps proofs green, builds the management-plane UI.
 
-## Roadmap (Phase 2 underway)
+## Roadmap (Phase 2 COMPLETE → Phase 3 next)
 APIC timer ✅ → preemptive round-robin scheduler ✅ → EDF policy + time-caps ✅ →
 ring 3 + syscall + first userspace cap_invoke ✅ → ring-3 hardening (M_FREE gate) ✅ →
 per-domain CapTables + Notification async IPC ✅ (step 4a) → portal IPC endpoints (sync
@@ -263,11 +273,12 @@ rendezvous) + scheduler block/wake + cap-transfer + 2nd ring-3 task ✅ (step 4b
 crash-only domain supervision (ring-3 fault terminates the domain, not the kernel) ✅ →
 crash-only restart / self-healing (supervisor re-admits under a budget) ✅ (Phase 2 COMPLETE) →
 **Phase 3 — zero-kernel I/O + object store (PCIe/virtio + extent caps) — NEXT** →
-Ring-3 follow-ups (deferred, see commit): fair co-scheduling (round-robin on equal EDF
-deadlines — currently lowest-index wins, so a co-scheduled shorter-period task starves the
-user task; demo runs the ring-3 task solo), return a Memory CPtr not a raw frame number to
-ring 3, M_FREE arg-ownership check, sysret canonical-RIP guard once user RIP is attacker-
-influenced, re-enable IF mid-syscall for blocking IPC, NMI paranoid-entry + SMEP/SMAP.
+Ring-3 follow-ups (deferred, see commits): fair co-scheduling (the demo now co-schedules
+faulter+client+server across domains and works, but equal EDF deadlines are still broken by
+lowest-index — no round-robin among equal deadlines), return a Memory CPtr (not a raw frame) to
+ring 3 — which also unblocks the real `M_FREE` ownership check (M_FREE is currently *refused*)
+and per-domain frame reclamation on death, sysret canonical-RIP guard once user RIP is
+attacker-influenced, re-enable IF mid-syscall for blocking IPC, NMI paranoid-entry + SMEP/SMAP.
 Follow-ups deferred from EDF: per-task budget *enforcement* (preempt on overrun; v0 only
 accounts), deadline-miss policy beyond finish-late, calibration accuracy on real HW,
 admission utilization check (Σ Cᵢ/Tᵢ≤1), and a way to revoke an *already-admitted* task's
