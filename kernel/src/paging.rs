@@ -78,16 +78,13 @@ pub fn manual_map(hhdm: u64, va: u64) -> bool {
     let va = va & !0xfff;
     let (l4f, _) = Cr3::read();
     let mut table_phys = l4f.start_address().as_u64();
-    crate::serial_println!("  mm hhdm={:#x} cr3phys={:#x} va={:#x}", hhdm, table_phys, va);
 
     // Walk L4 -> L3 -> L2; each must be a present, non-huge table.
     for shift in [39u32, 30, 21] {
         let t = (hhdm + table_phys) as *const u64;
         let idx = ((va >> shift) & 0x1ff) as usize;
         let e = unsafe { core::ptr::read_volatile(t.add(idx)) };
-        crate::serial_println!("  mm va={:#x} sh={} idx={} e={:#x}", va, shift, idx, e);
         if e & 1 == 0 || (e >> 7) & 1 == 1 {
-            crate::serial_println!("  mm BAIL at sh={} (missing/huge)", shift);
             return false;
         }
         table_phys = e & 0x000f_ffff_ffff_f000;
@@ -97,7 +94,6 @@ pub fn manual_map(hhdm: u64, va: u64) -> bool {
     let l1 = (hhdm + table_phys) as *mut u64;
     let i1 = ((va >> 12) & 0x1ff) as usize;
     let existing = unsafe { core::ptr::read_volatile(l1.add(i1)) };
-    crate::serial_println!("  mm L1 i1={} existing={:#x}", i1, existing);
     if existing & 1 == 1 {
         return true; // already mapped
     }
@@ -106,7 +102,6 @@ pub fn manual_map(hhdm: u64, va: u64) -> bool {
         Some(f) => f * 4096,
         None => return false,
     };
-    crate::serial_println!("  mm map {:#x} -> phys {:#x}", va, frame);
     unsafe {
         // present + writable
         core::ptr::write_volatile(l1.add(i1), frame | 0x3);
@@ -114,6 +109,28 @@ pub fn manual_map(hhdm: u64, va: u64) -> bool {
         core::ptr::write_bytes(va as *mut u8, 0, 4096);
     }
     true
+}
+
+/// Pre-map the entire kernel `.bss` from NORMAL (non-interrupt) context, where
+/// HHDM page-table reads are reliable — unlike the `#PF` handler, where reading
+/// the active L4 through the HHDM returned 0. Must run after the frame allocator
+/// is up and before any large bss static is first written.
+pub fn premap_bss(hhdm: u64) {
+    extern "C" {
+        static __bss_start: u8;
+        static __bss_end: u8;
+    }
+    let start = unsafe { core::ptr::addr_of!(__bss_start) as u64 };
+    let end = unsafe { core::ptr::addr_of!(__bss_end) as u64 };
+    let mut addr = start & !0xfff;
+    let mut ok = true;
+    while addr < end {
+        if !manual_map(hhdm, addr) {
+            ok = false;
+        }
+        addr += 0x1000;
+    }
+    crate::serial_println!("premap_bss [{:#x}..{:#x}) all_ok={}", start, end, ok);
 }
 
 /// Ensure the 4 KiB page containing `addr` is mapped present+writable. If it is

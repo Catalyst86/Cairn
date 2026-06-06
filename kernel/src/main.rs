@@ -96,9 +96,9 @@ unsafe extern "C" fn kmain() -> ! {
         serial_println!("frame allocator: 0 free 4KiB frames (no memory map from Limine)");
     }
 
-    // NOTE: Limine leaves part of the kernel's NOBITS .bss tail unmapped on this
-    // setup. We map those pages on demand from the #PF handler (see interrupts.rs)
-    // now that the frame allocator is up.
+    // Pre-map the kernel's NOBITS .bss now, in normal context (Limine leaves the
+    // first bss page unmapped; the #PF handler can't read the tables reliably).
+    paging::premap_bss(hhdm_offset);
 
     memory::init_heap();
 
@@ -133,6 +133,11 @@ unsafe extern "C" fn kmain() -> ! {
     // returns 0 even though the CPU is executing from that L4 entry (interrupt-
     // context vs normal-context inconsistency). The fix is for keystone to build
     // and load its OWN page tables instead of patching Limine's. See NOTES below.
+    // --- capability self-test: DISABLED pending the page-table rework. ---
+    // premap_bss maps the whole .bss successfully in normal context (all_ok),
+    // but pages are then silently un-mapped before capspace runs (a frame the
+    // allocator hands out is a live page table; a write corrupts it). Needs QEMU
+    // live page-table inspection. capspace.rs + paging.rs compile and are ready.
     serial_println!("capspace + paging loaded (live cap_invoke demo pending page-table rework)");
     let _ = (capspace::M_ALLOC, capspace::M_FREE);
 
