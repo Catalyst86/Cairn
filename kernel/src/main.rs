@@ -219,6 +219,29 @@ unsafe extern "C" fn kmain_main() -> ! {
     // --- Phase 3 (L3): mount the Cairnlog object store (format on first boot) ---
     objstore::mount();
 
+    // --- Phase 3 (L4): INC6 objects survive reboot (T2 milestone) ---
+    // The store persists: each boot's committed `put` becomes the NEXT boot's mounted root.
+    // recover() re-derives that committed root from the superblock and re-verifies its on-disk
+    // content hash; we then RE-MINT a live Extent cap from it (CPtrs are ephemeral — re-derived
+    // each boot from the durable content hash) and cap_invoke(X_READ) to confirm the cap names
+    // the same hash. Runs BEFORE this boot's INC5 put, so it reflects the PRIOR boot's root. On
+    // a fresh store there is no committed root yet (root_len=0) → skipped. Across two runs on the
+    // persisted disk, run2 recovers run1's committed object WITHOUT a new put producing it —
+    // that is "objects survive reboot".
+    match objstore::recover() {
+        Some((rlba, rlen, rhash)) => match capspace::mint_extent(rlba, rlen, rhash) {
+            Some(root_ext) => {
+                let (rst, rh) = capspace::cap_invoke(root_ext, capspace::X_READ, 0);
+                serial_println!(
+                    "objstore: recovered root Extent cptr={} lba={} len={} hash={:#x} (on-disk re-hash matched); X_READ=>{:?} reply_hash={:#x}; objects-survive-reboot={}",
+                    root_ext, rlba, rlen, rhash, rst, rh, rst == Status::Ok && rh == rhash
+                );
+            }
+            None => serial_println!("objstore: recover mint_extent failed"),
+        },
+        None => serial_println!("objstore: no committed root to recover (fresh store)"),
+    }
+
     // --- Phase 3 (L4): INC5 append-log put + content-addressed Extent caps ---
     // `put` writes the data sectors + a record header, flushes, then flips the OTHER
     // superblock slot (seq+1, new root) — that flip is the commit. We then mint an Extent

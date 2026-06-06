@@ -355,3 +355,26 @@ pub fn extent_content_hash(lba: u64, len: u32) -> Option<u64> {
     }
     Some(h)
 }
+
+/// Recover the committed root extent from the mounted superblock (INC6 — objects survive
+/// reboot). Returns the persisted root `{lba, len, hash}` iff the store is mounted, has a
+/// non-empty committed root, AND that root's on-disk bytes still hash to the committed
+/// `root_hash` (a content-integrity check on the persisted root — a torn root or a
+/// superblock pointing at corrupt bytes yields `None`). `None` also for a fresh/empty store
+/// (`root_len == 0`). The returned hash is the durable content NAME; the caller re-mints a
+/// (ephemeral) Extent cap from it — caps are re-derived from on-disk content each boot, since
+/// CPtrs are not persisted (sealed sparse tokens are CAP_ABI §7, deferred).
+///
+/// ORDERING: call this right after `mount`, BEFORE any `put` this boot — it reflects the root
+/// committed by the PREVIOUS boot (a `put` advances `MOUNTED` to a new root).
+pub fn recover() -> Option<(u64, u32, u64)> {
+    // SAFETY: single-CPU, IRQs off; snapshot the mounted state (sole accessor).
+    let (cur, ok) = unsafe { (MOUNTED, MOUNTED_OK) };
+    if !ok || cur.root_len == 0 {
+        return None;
+    }
+    match extent_content_hash(cur.root_lba, cur.root_len) {
+        Some(h) if h == cur.root_hash => Some((cur.root_lba, cur.root_len, cur.root_hash)),
+        _ => None, // root bytes unreadable or hash mismatch — do not advertise a corrupt root
+    }
+}
