@@ -21,6 +21,7 @@ mod gdt;
 mod interrupts;
 mod memory;
 mod paging;
+mod pci;
 mod capspace;
 mod sched;
 mod serial;
@@ -204,6 +205,10 @@ unsafe extern "C" fn kmain_main() -> ! {
     }
 
     memory::init_heap();
+
+    // --- Phase 3 (L0): enumerate PCI bus 0 (IRQs still off — BAR-size probe is atomic) ---
+    // Discovers the virtio-blk device + its MMIO BARs (the config window the driver maps next).
+    pci::scan();
 
     // --- self-tests (as specified) ---
 
