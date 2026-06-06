@@ -38,6 +38,11 @@ pub fn init_idt() {
         idt.general_protection_fault.set_handler_fn(general_protection_handler);
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
 
+        // Hardware interrupts (APIC). Timer drives the future scheduler; the
+        // spurious handler keeps a stray APIC spurious IRQ from becoming a #GP.
+        idt[crate::apic::TIMER_VECTOR].set_handler_fn(timer_interrupt_handler);
+        idt[crate::apic::SPURIOUS_VECTOR].set_handler_fn(spurious_interrupt_handler);
+
         idt
     });
 
@@ -143,4 +148,22 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
             core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
         }
     }
+}
+
+// ---------------- hardware interrupts (APIC) ----------------
+
+/// Periodic APIC timer. Bumps the global tick counter and signals EOI. Output is
+/// throttled (first few + every 100th) so a fast timer doesn't flood the serial log.
+extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    use core::sync::atomic::Ordering;
+    let t = crate::apic::TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if t <= 5 || t % 100 == 0 {
+        crate::serial_println!("timer tick #{}", t);
+    }
+    crate::apic::eoi();
+}
+
+/// APIC spurious interrupt. By spec it needs no EOI; just return.
+extern "x86-interrupt" fn spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    crate::serial_println!("APIC: spurious interrupt");
 }

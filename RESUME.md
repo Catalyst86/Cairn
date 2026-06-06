@@ -4,7 +4,13 @@
 Cairn is a from-scratch, capability-based OS for James's HPE ProLiant x86-64 server,
 built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\Desktop\Cairn`.
 
-## Status (milestone: cap_invoke is LIVE; stack hardened)
+## Status (milestone: cap_invoke LIVE; stack hardened; APIC timer ticking)
+- ✅ **APIC periodic timer (Phase 2 foundation).** `kernel/src/apic.rs` brings up the
+  **xAPIC via MMIO** (TCG does NOT emulate x2APIC), masks the legacy PIC, and runs a
+  periodic timer on vector `0x20`; the ISR bumps `apic::TICKS` + EOIs. Boot log shows
+  `timer tick #1..#5, #100`. The LAPIC MMIO page (`0xFEE00000`) is mapped explicitly
+  (`paging::map_mmio`, no-cache) since Limine's HHDM doesn't cover it. Uncalibrated for
+  now (raw reload count); real time units arrive with the scheduler.
 - ✅ **keystone boots cleanly in QEMU** (Phase 0/1): serial → switch to a **512 KiB
   guard-paged kernel stack** → GDT/IDT → frame allocator → 1 MB kernel heap → #BP
   exception recovery.
@@ -113,9 +119,10 @@ backstop. Building keystone's own page tables is now OPTIONAL polish, not a bloc
 - **Claude** orchestrates, reviews Grok's `unsafe`, drives the build/boot/verify loop and
   (later) the real-hardware loop, keeps proofs green, builds the management-plane UI.
 
-## Roadmap after the cap_invoke milestone
-APIC timer + EDF scheduler (time-caps) → `syscall`/`sysret` + ring 3 + first userspace
-domain doing a real cap_invoke → portal IPC → Phase 3 (zero-kernel I/O + object store) →
+## Roadmap (Phase 2 underway)
+APIC timer ✅ → **EDF scheduler (time-caps) — NEXT, Grok's lane** (build on `apic::TICKS`;
+will need timer calibration for real deadlines) → `syscall`/`sysret` + ring 3 + first
+userspace domain doing a real cap_invoke → portal IPC → Phase 3 (zero-kernel I/O + object store) →
 Phase 4 (network-boot onto the real HPE ProLiant via James's existing iPXE server; see the
 `studio-server-access` memory) → Phase 5 (confidential boot + beautiful management plane).
 Keep adding Kani proofs per component; finish the `frame-alloc` proofs. Building keystone's

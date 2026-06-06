@@ -154,6 +154,35 @@ pub fn unmap_page(hhdm: u64, va: u64) -> bool {
     true
 }
 
+/// Map a single device-MMIO page: `virt` -> `phys`, present + writable + no-cache
+/// + no-execute, creating any missing intermediate tables from the frame allocator.
+/// Used to map the Local APIC register window. Returns false if the page is already
+/// mapped or a frame could not be allocated.
+///
+/// (NO_CACHE is correct for MMIO on real hardware. Under QEMU TCG it is moot —
+/// MMIO is dispatched by address — but we set it anyway for correctness.)
+pub fn map_mmio(hhdm_offset: u64, virt: u64, phys: u64) -> bool {
+    let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(virt & !0xfff));
+    let frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(PhysAddr::new(phys & !0xfff));
+    let mut mapper = unsafe { active_mapper(hhdm_offset) };
+    let mut frames = KernelFrames;
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::NO_CACHE
+        | PageTableFlags::NO_EXECUTE;
+    // SAFETY: mapping a device-MMIO page to a fixed physical address; map_to flushes
+    // the new mapping and allocates any intermediate tables from our frame allocator.
+    unsafe {
+        match mapper.map_to(page, frame, flags, &mut frames) {
+            Ok(flush) => {
+                flush.flush();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 /// Ensure the 4 KiB page containing `addr` is mapped present+writable. If it is
 /// already mapped, this is a no-op; otherwise a fresh frame is allocated, mapped,
 /// and zeroed (bss must read as zero). Returns true if the page is mapped on exit.

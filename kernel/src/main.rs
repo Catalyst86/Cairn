@@ -16,6 +16,7 @@ extern crate alloc;
 
 use core::arch::asm;
 
+mod apic;
 mod gdt;
 mod interrupts;
 mod memory;
@@ -222,6 +223,16 @@ unsafe extern "C" fn kmain_main() -> ! {
             serial_println!("demo_revoke_then_invoke => {:?}", rs);
         }
         None => serial_println!("init_root failed"),
+    }
+
+    // --- Phase 2 foundation: APIC periodic timer ---
+    // Start the LAPIC timer and enable interrupts; the ISR ticks TICKS. This is
+    // the clock the EDF scheduler (next) will preempt and schedule from.
+    if apic::init_timer(hhdm_offset, 10_000_000) {
+        x86_64::instructions::interrupts::enable(); // sti
+        serial_println!("interrupts enabled — halting; expect periodic timer ticks");
+    } else {
+        serial_println!("timer unavailable — halting without ticks");
     }
 
     hcf();
