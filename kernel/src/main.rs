@@ -258,7 +258,8 @@ unsafe extern "C" fn kmain_main() -> ! {
         const EXT_NEG_DOMAIN: usize = 3;
         let msg = b"CAIRN-EXTENT-INC5: content-addressed put + Extent cap proof";
         match objstore::put(msg) {
-            Some((lba, len, hash)) => match capspace::mint_extent(lba, len, hash) {
+            Some((lba, len, hash)) => {
+                match capspace::mint_extent(lba, len, hash) {
                 Some(ext) => {
                     let (rst, rhash) = capspace::cap_invoke(ext, capspace::X_READ, 0);
                     let meta = capspace::extent_metadata(0, ext);
@@ -285,6 +286,40 @@ unsafe extern "C" fn kmain_main() -> ! {
                     }
                 }
                 None => serial_println!("extent: mint_extent failed"),
+                }
+
+                // --- Phase 3 (L4): INC7b Extent MAP — bytes reach a domain via MAP ---
+                // Map the just-committed extent's PERSISTED bytes read-only into a domain (the
+                // Extent object's "bytes via MAP, never a register" promise — CAP_ABI §5). load_extent
+                // DMAs the sectors into a RAM frame (pre-`sti`; the kernel owns queue 0); X_MAP
+                // (exercises Rights::MAP) maps that frame RO at EXTENT_MAP_BASE; we read the mapped
+                // bytes and confirm fnv1a == the committed content hash. Negative: a MAP-masked copy
+                // (INVOKE|READ, no MAP) is refused X_MAP (ErrRights).
+                if let Some(frame_phys) = objstore::load_extent(lba, len) {
+                    if let Some(mext) = capspace::mint_extent_mapped(lba, len, hash, frame_phys) {
+                        let (mst, va) = capspace::cap_invoke(mext, capspace::X_MAP, 0);
+                        let mapped_hash = if mst == Status::Ok {
+                            // SAFETY: X_MAP just mapped `len` bytes RO at `va`; single-CPU, IRQs off.
+                            let bytes =
+                                unsafe { core::slice::from_raw_parts(va as *const u8, len as usize) };
+                            Some(objstore::fnv1a(bytes))
+                        } else {
+                            None
+                        };
+                        let nomap = capspace::delegate_from_root(
+                            EXT_NEG_DOMAIN, mext, Rights::INVOKE | Rights::READ, 0,
+                        )
+                        .map(|c| capspace::cap_invoke_in(EXT_NEG_DOMAIN, c, capspace::X_MAP, 0).0);
+                        serial_println!(
+                            "extent: X_MAP=>{:?} va={:#x}; mapped-bytes hash={:?} committed={:#x} match={}; MAP-masked X_MAP=>{:?} (expect ErrRights)",
+                            mst, va, mapped_hash, hash, mapped_hash == Some(hash), nomap
+                        );
+                    } else {
+                        serial_println!("extent: mint_extent_mapped failed");
+                    }
+                } else {
+                    serial_println!("extent: load_extent failed (X_MAP proof skipped)");
+                }
             },
             None => serial_println!("extent: objstore::put failed"),
         }

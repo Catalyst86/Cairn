@@ -64,6 +64,16 @@ pub const E_RECV: u16 = 2;
 pub const X_READ: u16 = 1;
 pub const X_WRITE: u16 = 2;
 pub const X_COMMIT: u16 = 3;
+/// `X_MAP` (INC7b, needs INVOKE|**MAP**) maps a committed extent's persisted bytes read-only
+/// into the calling domain at [`EXTENT_MAP_BASE`] and returns that VA — the fulfilment of the
+/// Extent object's "bytes reach a domain via MAP, never a register" promise (CAP_ABI §5). The
+/// bytes must first be loaded into a RAM frame (`objstore::load_extent`, recorded in the
+/// side-table) since extent data lives on disk; X_MAP itself only maps (no I/O).
+pub const X_MAP: u16 = 4;
+
+/// Fixed USER virtual address where `X_MAP` maps a committed extent's bytes (read-only). Chosen
+/// clear of the demo code/stack region and the INC7 DeviceQueue window ([`DQ_BASE`]..+0x5000).
+pub const EXTENT_MAP_BASE: u64 = 0x110_0000;
 
 /// Method IDs for the DeviceQueue object kind (Phase 3 INC7 zero-kernel I/O — the namesake
 /// pillar-4 milestone). `DQ_INFO` (needs INVOKE|READ) echoes the device queue size;
@@ -162,8 +172,12 @@ struct ExtentMeta {
     lba: u64,
     len: u32,
     hash: u64,
+    /// RAM frame (raw guest-phys) holding the extent's bytes for Extent **MAP** (INC7b), or 0
+    /// if not loaded. The bytes live on disk; `objstore::load_extent` DMAs them into this frame
+    /// (pre-`sti`), and `X_MAP` maps it read-only into a domain (bytes via MAP, never a register).
+    data_frame_phys: u64,
 }
-const EXT_EMPTY: ExtentMeta = ExtentMeta { lba: 0, len: 0, hash: 0 };
+const EXT_EMPTY: ExtentMeta = ExtentMeta { lba: 0, len: 0, hash: 0, data_frame_phys: 0 };
 /// Per-Extent side-table. const static-init (no boot-stack temporary).
 /// SAFETY contract: single-CPU, accessed only with interrupts off (see module docs).
 static mut EXTENTS: [ExtentMeta; OBJECT_TABLE_SIZE] = [EXT_EMPTY; OBJECT_TABLE_SIZE];
@@ -324,8 +338,9 @@ fn dispatch_method(kind: ObjectKind, oid: u64, rights: Rights, method: u16, arg:
         (ObjectKind::Notification, N_POLL) => Rights::READ,
         (ObjectKind::Extent, X_READ) => Rights::READ,
         (ObjectKind::Extent, X_WRITE) | (ObjectKind::Extent, X_COMMIT) => Rights::WRITE,
+        (ObjectKind::Extent, X_MAP) => Rights::MAP, // INC7b: map persisted bytes into a domain
         (ObjectKind::DeviceQueue, DQ_INFO) => Rights::READ,
-        (ObjectKind::DeviceQueue, DQ_MAP) => Rights::MAP, // FIRST live use of Rights::MAP
+        (ObjectKind::DeviceQueue, DQ_MAP) => Rights::MAP, // FIRST live use of Rights::MAP (INC7)
         (ObjectKind::DeviceQueue, DQ_REPORT) => Rights::WRITE,
         _ => Rights::empty(),
     };
@@ -372,6 +387,8 @@ fn dispatch_method(kind: ObjectKind, oid: u64, rights: Rights, method: u16, arg:
             };
             (Status::Ok, h)
         }
+        // Extent X_MAP (INC7b): map the extent's persisted bytes RO into the domain (MAP gated above).
+        (ObjectKind::Extent, X_MAP) => extent_map(oid),
         // DeviceQueue (INC7 zero-kernel I/O): INFO echoes qsize; MAP maps the rings+doorbell
         // into the trusted driver domain (first live Rights::MAP); REPORT validates the driver's
         // zero-syscall I/O result. Rights enforced by the `extra` gate above.
@@ -751,6 +768,17 @@ pub fn mint_timeslice() -> Option<u16> {
 /// [`crate::objstore::put`]) lives in `EXTENTS[oid]` because cap-core's `ObjectMeta` is frozen.
 /// Returns the root-domain CPtr.
 pub fn mint_extent(lba: u64, len: u32, hash: u64) -> Option<u16> {
+    mint_extent_inner(lba, len, hash, 0)
+}
+
+/// Like [`mint_extent`], but also records `data_frame_phys` — a RAM frame (from
+/// [`crate::objstore::load_extent`]) holding the extent's bytes — so the cap supports Extent
+/// `X_MAP` (INC7b). Use for an extent you intend to MAP into a domain.
+pub fn mint_extent_mapped(lba: u64, len: u32, hash: u64, data_frame_phys: u64) -> Option<u16> {
+    mint_extent_inner(lba, len, hash, data_frame_phys)
+}
+
+fn mint_extent_inner(lba: u64, len: u32, hash: u64, data_frame_phys: u64) -> Option<u16> {
     let mut objs_g = objects().lock();
     // SAFETY: single-CPU, IRQs off; sole accessor of DOMAINS in this region.
     let doms = unsafe { &mut *core::ptr::addr_of_mut!(DOMAINS) };
@@ -761,7 +789,7 @@ pub fn mint_extent(lba: u64, len: u32, hash: u64) -> Option<u16> {
     }
     // SAFETY: single-CPU, IRQs off; sole writer of EXTENTS[oid] at mint.
     unsafe {
-        (*core::ptr::addr_of_mut!(EXTENTS))[i] = ExtentMeta { lba, len, hash };
+        (*core::ptr::addr_of_mut!(EXTENTS))[i] = ExtentMeta { lba, len, hash, data_frame_phys };
     }
     let rights = Rights::INVOKE | Rights::READ | Rights::WRITE | Rights::MAP | Rights::DELEGATE;
     doms.tables[0].mint(&*objs_g, oid, rights, 0).ok()
@@ -829,6 +857,30 @@ pub fn create_device_queue(magic: u64, scratch_lba: u64) -> Option<u16> {
     }
     let rights = Rights::INVOKE | Rights::READ | Rights::WRITE | Rights::MAP | Rights::DELEGATE;
     doms.tables[0].mint(&*objs_g, oid, rights, 0).ok()
+}
+
+/// `X_MAP` work arm (INC7b): map a committed extent's loaded bytes READ-ONLY at
+/// [`EXTENT_MAP_BASE`] into the (single, shared) address space, USER-accessible, and return the
+/// base VA — the Extent object's "bytes reach a domain via MAP, never a register" fulfilment. The
+/// bytes must already be loaded into a RAM frame (`objstore::load_extent`, recorded as
+/// `data_frame_phys`); X_MAP performs NO I/O. The mapping is read-only (the persisted extent is
+/// immutable) and NX. MAP was enforced by the `extra` gate. Returns ErrMethod if not loaded.
+fn extent_map(oid: u64) -> (Status, u64) {
+    let i = oid as usize;
+    if i >= OBJECT_TABLE_SIZE {
+        return (Status::ErrBadCPtr, 0);
+    }
+    // SAFETY: single-CPU, IRQs off; `i` bounds-checked; shared read of EXTENTS.
+    let frame = unsafe { (*core::ptr::addr_of!(EXTENTS))[i].data_frame_phys };
+    if frame == 0 {
+        return (Status::ErrMethod, 0); // extent not loaded for mapping
+    }
+    let hhdm = crate::memory::hhdm_offset();
+    if crate::paging::map_user_phys(hhdm, EXTENT_MAP_BASE, frame, false, false, false) {
+        (Status::Ok, EXTENT_MAP_BASE)
+    } else {
+        (Status::ErrMethod, 0)
+    }
 }
 
 /// Read a DeviceQueue's negotiated queue size (the `DQ_INFO` reply).

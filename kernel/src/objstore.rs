@@ -378,3 +378,38 @@ pub fn recover() -> Option<(u64, u32, u64)> {
         _ => None, // root bytes unreadable or hash mismatch — do not advertise a corrupt root
     }
 }
+
+/// Load an extent's on-disk bytes into a fresh zeroed RAM frame and return the frame's RAW
+/// guest-phys, for Extent **MAP** (INC7b) — extent data lives on disk, so it must be DMA'd into
+/// RAM before it can be mapped into a domain. Reads `ceil(len/512)` sectors from `lba` into the
+/// frame (the last sector's tail beyond `len` stays zero). v0 maps single-frame extents only
+/// (`1..=4096` bytes); returns `None` for an out-of-range `len` or a block error.
+///
+/// MUST run pre-`sti` (it uses the kernel's queue 0; after `sti` a ring-3 driver may own it).
+pub fn load_extent(lba: u64, len: u32) -> Option<u64> {
+    let len = len as usize;
+    if len == 0 || len > 4096 {
+        return None; // v0: single-frame extents
+    }
+    let fnum = crate::memory::allocate_frame()?;
+    let phys = fnum * 4096;
+    let hhdm = crate::memory::hhdm_offset();
+    let frame = (hhdm + phys) as *mut u8;
+    // SAFETY: fresh frame, accessed via its HHDM alias; single-CPU, IRQs off.
+    unsafe { core::ptr::write_bytes(frame, 0, 4096) };
+    let nsect = len.div_ceil(512);
+    let mut s = 0usize;
+    while s < nsect {
+        let mut sect = [0u8; 512];
+        if !virtio_blk::read_sector(lba + s as u64, &mut sect) {
+            crate::memory::deallocate_frame(fnum); // don't leak the frame on a block error
+            return None;
+        }
+        let off = s * 512;
+        let n = if len - off >= 512 { 512 } else { len - off };
+        // SAFETY: copy this sector's bytes into the frame's HHDM alias at the right offset.
+        unsafe { core::ptr::copy_nonoverlapping(sect.as_ptr(), frame.add(off), n) };
+        s += 1;
+    }
+    Some(phys)
+}
