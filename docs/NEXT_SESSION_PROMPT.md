@@ -37,7 +37,8 @@ panic/fault anywhere):
   (fresh store)` on the first boot after `rm`); and the INC7 zero-kernel I/O proof `devqueue: DQ_MAP
   (first live Rights::MAP) => Ok base=0x1000000; MAP-masked copy DQ_MAP => Some(ErrRights)` then
   `devqueue: ring3 driver completed virtio READ of LBA 32700 with ZERO syscalls; reported magic=…07
-  kernel-seeded=…07 match=true`, then `domain 5 (task 4) terminated: #UD …` (driver's clean v0 exit).
+  kernel-seeded=…07 match=true`, then `domain 5 (task 4) terminated: #UD …` (driver's clean v0 exit),
+  then the INC7c reap-teardown line `reap: domain 5 torn down — unmapped 5/5 granted page(s) …`.
   The store persists — each boot `seq` grows, the same bytes re-`put` to a fresh `lba` with the SAME
   hash (CoW), and `recover()` re-mints the prior boot's committed root from disk.
 - Phase 2 (after the cap self-tests, post-`sti`): the crash-only self-healing loop
@@ -55,23 +56,22 @@ panic/fault anywhere):
   objects-survive-reboot ✅ (T2), INC7 zero-kernel DeviceQueue I/O ✅ (T1, first live `Rights::MAP`:
   a ring-3 driver does a full virtio-blk READ with ZERO syscalls over a granted DeviceQueue cap),
   INC7b Extent MAP ✅ (second live `Rights::MAP`: a committed extent's persisted bytes mapped RO into
-  a domain, re-hash == committed hash). Each subtle increment went through a design and/or adversarial
-  panel. **BOTH Phase-3 theses now hold — T1 (kernel out of the I/O path) + T2 (objects survive
-  reboot) — and the Extent + DeviceQueue capability models are complete.** Last feature commit: `02dc95e`.
+  a domain, re-hash == committed hash), INC7c reap teardown ✅ (a reaped domain's DQ_MAP/X_MAP pages are
+  unmapped — the DMA window is closed; unmap-only, frames are object-owned). Each subtle increment went
+  through a design and/or adversarial panel. **BOTH Phase-3 theses hold — T1 (kernel out of the I/O
+  path) + T2 (objects survive reboot) — the Extent + DeviceQueue capability models are complete, and
+  reap teardown closes the DMA-mapping leak.** Last feature commit: `82980f9`.
 
-## STEP 3 — Your task: optional Phase-3 hardening (reap teardown) OR pivot to Phase 4
-Phase 3's CORE IS COMPLETE (T1+T2 proven; Extent + DeviceQueue models done). What remains is optional
-hardening + the next phase — **confirm direction with the user** (they may prefer Phase 4, or a
-different priority). cap-core stays byte-unchanged (`unmap_page` already exists). Candidate work:
-- **Reap teardown** (close the accepted v0 leak): `reap_domain` revokes a dead driver's cap but does
-  NOT unmap its `DQ_MAP`/Extent pages — a leaked write-anywhere-DMA mapping. Add a per-domain mapping
-  ledger (which USER VAs were mapped) + walk it on reap calling `paging::unmap_page`, AND reset queue 0
-  (re-establish kernel ownership) since a dead driver may have an in-flight descriptor. NOTE the
-  frame-ownership asymmetry: DeviceQueue frames are device-owned (unmap ONLY); Extent scratch frames
-  are mapping-owned (unmap + `deallocate_frame`). This is SUBTLE — design panel + adversarial review.
-- **Later / Phase-4-slippable:** `DQ_SUBMIT` kernel-validated descriptors (the v1 escalation rung);
-  IRQ completion (`IrqHandler` + `Notification` instead of polling); VT-d/intel-iommu scaffold (the
-  real DMA-containment fix). See `docs/PHASE3.md` INC7b + the DMA-trust-boundary escalation ladder.
+## STEP 3 — Your task: optional escalation rungs OR pivot to Phase 4
+Phase 3's CORE IS COMPLETE (T1+T2 proven; Extent + DeviceQueue models done; reap teardown done). What
+remains is optional hardening + the next phase — **confirm direction with the user** (they may prefer
+Phase 4, or a different priority). cap-core stays byte-unchanged. Candidate work:
+- **Escalation rungs / DMA containment:** `DQ_SUBMIT` kernel-validated descriptors (the v1 step — the
+  kernel checks each descriptor addr ∈ the DeviceQueue's owned frames); IRQ completion (`IrqHandler`
+  + `Notification` instead of polling); VT-d/intel-iommu scaffold (the real per-domain DMA-containment
+  fix; QEMU q35 can model `intel-iommu`). See `docs/PHASE3.md` + the DMA-trust-boundary escalation ladder.
+- **Object lifecycle:** object-destroy/revoke + frame reclamation (the deferred frame-free path — the
+  Extent data frame + a destroyed DeviceQueue's rings currently leak for the boot's lifetime).
 - **Phase 4 alternative:** network-boot onto James's HPE ProLiant via the existing iPXE server; the
   big SMP/ACPI/NUMA retrofit (per-CPU run queues, real locks, CR3-per-address-space). See the
   `studio-server-access` memory + `docs/DESIGN.md` phases.
@@ -136,5 +136,6 @@ substrate, and the kernel gets out of the data path.* Phase 3 makes that real (E
 log-structured store; DeviceQueue caps for kernel-free I/O at INC7).
 
 Start by reading `RESUME.md`, confirming the clean boot, then (Phase-3 core is complete) confirm with
-the user whether to do the optional reap-teardown hardening or pivot to Phase 4. Ask me nothing you
-can answer from the repo — but do confirm direction before any large multi-agent workflow run.
+the user whether to do the optional escalation/DMA-containment rungs, the object-lifecycle frame
+reclamation, or pivot to Phase 4. Ask me nothing you can answer from the repo — but do confirm
+direction before any large multi-agent workflow run.

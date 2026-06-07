@@ -154,14 +154,24 @@ CPtrs are ephemeral — sealed sparse 128-bit persisted tokens are CAP_ABI §7, 
   (3 finders → 3-skeptic refute; 4 findings, 0 confirmed — single-window X_MAP, the documented
   global-mapping invariant, etc., all accepted v0 limitations). cap-core byte-unchanged. Both Phase-3
   theses (T1+T2) now hold and the Extent + DeviceQueue capability models are complete.
-- **NEXT (Phase-3 hardening, optional) — reap teardown + escalation rungs:** `reap_domain` revokes a
-  dead driver's caps but does NOT unmap its `DQ_MAP`/`X_MAP` pages (accepted v0 leak) — add a
-  per-domain mapping ledger + `unmap`-on-reap + queue-0 reset so a reaped driver can't leave a live
-  write-anywhere-DMA mapping (SUBTLE: frame-ownership asymmetry — DeviceQueue frames are device-owned
-  so unmap-only; Extent scratch frames are mapping-owned so unmap + `deallocate_frame`). Later:
-  `DQ_SUBMIT` kernel-validated descriptors; IRQ completion (`IrqHandler` + `Notification`); VT-d
-  scaffold (the real DMA-containment fix). **Or pivot to Phase 4** (real-hardware network-boot +
-  SMP/ACPI retrofit) — Phase 3's core is complete.
+- **INC7c — reap teardown ✅ DONE** (commit `82980f9`; `capspace.rs`). Closes the v0 leak where a
+  reaped driver's `DQ_MAP`-ed virtqueue ring stayed mapped (a lingering write-anywhere-DMA window in
+  the single shared address space). A per-domain mapping ledger (`DOMAIN_MAPS`) records each
+  `DQ_MAP`/`X_MAP` USER VA under the invoking domain (`domain` threaded through `dispatch_method`);
+  `reap_domain` UNMAPS them when the domain dies. **UNMAP-ONLY** — reaping revokes the dead domain's
+  memory access (like clearing its CapTable) but does NOT free the backing frames: they are
+  object-owned (the live virtio rings; an extent's data frame pinned by `EXTENTS[oid]` for other
+  holders), reclaimed at object-destroy (deferred). **Proof:** the driver (domain 5) exits via
+  `ud2` → `reap: domain 5 torn down — unmapped 5/5 granted page(s)`. **Adversarial review** (3
+  finders → 3-skeptic; 5 findings, 1 confirmed): the initial draft tagged the Extent frame
+  mapping-owned and freed it on reap — a latent double-free/UAF (it is object-owned); FIXED by the
+  unmap-only design. Queue-0 reset on driver death is deferred (nothing reuses queue 0 after a driver
+  dies in v0).
+- **NEXT (optional) — escalation rungs OR Phase 4:** `DQ_SUBMIT` kernel-validated descriptors (the
+  v1 DMA-containment-lite step); IRQ completion (`IrqHandler` + `Notification` instead of polling);
+  VT-d/`intel-iommu` scaffold (the real DMA-containment fix); object-destroy + frame reclamation (the
+  deferred frame-free path). **Or pivot to Phase 4** (real-hardware network-boot + SMP/ACPI retrofit)
+  — Phase 3's core is complete (T1+T2; Extent + DeviceQueue models; reap teardown).
 
 ## QEMU / disk setup (in `C:\WSL\cairn-go-kernel.sh`, NOT the repo)
 A persistent **16 MiB raw disk** `/root/cairn-disk.img` (created once via `truncate` — `qemu-img`
