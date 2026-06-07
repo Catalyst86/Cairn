@@ -478,7 +478,84 @@ unsafe extern "C" fn kmain_main() -> ! {
             );
         }
 
-        serial_println!("scheduler: enabling EDF preemption (client+server endpoint IPC)");
+        // --- Phase 3 INC7: zero-kernel DeviceQueue I/O (T1 milestone, the namesake) ---
+        // A trusted ring-3 driver (domain 5) does a full virtio-blk READ — descriptor chain,
+        // doorbell, used-ring poll — with ZERO syscalls, over a granted DeviceQueue cap whose
+        // DQ_MAP mapped the rings+buffer+doorbell into the (shared) address space. The kernel
+        // seeds a known magic at a scratch LBA, clears the shared buffer to a sentinel (so the
+        // read must genuinely come from disk), bakes the I/O params into the buffer tail, DQ_MAPs
+        // the rings via cap_invoke (the FIRST live use of Rights::MAP), then admits the driver
+        // with the earliest deadline so it runs first and exits (#UD). Trust boundary: no IOMMU +
+        // one shared address space => the mapped ring is write-anywhere DMA, gated ONLY by who
+        // holds the cap (see docs/PHASE3.md). cap-core byte-unchanged.
+        const DRIVER_DOMAIN: usize = 5;
+        const DQ_MAGIC: u64 = 0xCA17_07D0_DEAD_0007;
+        const DQ_SCRATCH_LBA: u64 = 32_700; // clear of the objstore log and the L2 smoke LBA (32760)
+        {
+            // 1. Seed the known magic at the scratch LBA (after smoke_test/objstore; pre-sti).
+            let mut seed = [0u8; 512];
+            seed[0..8].copy_from_slice(&DQ_MAGIC.to_le_bytes());
+            let seeded = virtio_blk::write_sector(DQ_SCRATCH_LBA, &seed);
+            let dqd = virtio_blk::device_queue_desc();
+            // 2. Build the DeviceQueue cap (snapshots queue-0 phys layout + the proof state).
+            let dq_root = capspace::create_device_queue(DQ_MAGIC, DQ_SCRATCH_LBA);
+            if let (true, Some(dqd), Some(dq_root)) = (seeded, dqd, dq_root) {
+                // 3. Clear the shared data buffer to a sentinel, then bake the I/O params into
+                //    the buffer tail (buf_phys+2048) — both via the kernel HHDM alias. SAFETY:
+                //    single-CPU, IRQs off; the buffer frame is live device RAM we own pre-sti.
+                unsafe {
+                    let buf = (hhdm_offset + dqd.buf_phys) as *mut u8;
+                    core::ptr::write_bytes(buf.add(512), 0, 8); // sentinel (!= magic)
+                    let p = buf.add(2048) as *mut u64;
+                    p.add(0).write_unaligned(dqd.buf_phys);
+                    p.add(1).write_unaligned(DQ_SCRATCH_LBA);
+                    p.add(2).write_unaligned(dqd.qsize as u64);
+                    p.add(3).write_unaligned(dqd.doorbell_phys & 0xfff); // doorbell sub-page offset
+                }
+                // 4. Delegate the cap into the driver domain (slot 0 -> RDI) WITH MAP, and a
+                //    MAP-masked copy into the transient domain 3 for the negative test.
+                let dq_drv = capspace::delegate_from_root(
+                    DRIVER_DOMAIN, dq_root,
+                    Rights::INVOKE | Rights::READ | Rights::WRITE | Rights::MAP, 0,
+                );
+                let dq_nomap = capspace::delegate_from_root(
+                    3, dq_root, Rights::INVOKE | Rights::READ | Rights::WRITE, 0,
+                );
+                if let Some(dqc) = dq_drv {
+                    // 5. DQ_MAP via the verified invoke (FIRST live Rights::MAP); negative test:
+                    //    a MAP-masked copy is refused DQ_MAP (ErrRights).
+                    let (mst, base) = capspace::cap_invoke_in(DRIVER_DOMAIN, dqc, capspace::DQ_MAP, 0);
+                    let deny = dq_nomap.map(|c| capspace::cap_invoke_in(3, c, capspace::DQ_MAP, 0).0);
+                    serial_println!(
+                        "devqueue: DQ_MAP (first live Rights::MAP) => {:?} base={:#x}; MAP-masked copy DQ_MAP => {:?} (expect ErrRights)",
+                        mst, base, deny
+                    );
+                    // 6. Admit the ring-3 driver in domain 5 with the EARLIEST deadline so it
+                    //    runs first; its ONLY syscall is the final DQ_REPORT, then it exits (#UD).
+                    let driver_blob = user::setup_user_task(
+                        hhdm_offset, 0x43_0000, 0x7c_f000, user::driver_main, user::driver_main_end,
+                    );
+                    match (driver_blob, capspace::mint_timeslice()) {
+                        (Some((de, ds)), Some(dt)) => {
+                            let d = sched::admit_user(
+                                de, ds, dqc, dt, DRIVER_DOMAIN as u16, 2_000_000, 2_000_000, 1_000_000,
+                            );
+                            serial_println!(
+                                "devqueue: admitted ring3 driver (domain{})={:?} dq_cptr={} (zero-syscall virtio READ of LBA {})",
+                                DRIVER_DOMAIN, d, dqc, DQ_SCRATCH_LBA
+                            );
+                        }
+                        _ => serial_println!("devqueue: driver task setup incomplete"),
+                    }
+                } else {
+                    serial_println!("devqueue: delegate DeviceQueue into driver domain failed");
+                }
+            } else {
+                serial_println!("devqueue: INC7 setup incomplete (seeded={})", seeded);
+            }
+        }
+
+        serial_println!("scheduler: enabling EDF preemption (client+server endpoint IPC + INC7 driver)");
         x86_64::instructions::interrupts::enable(); // sti
     } else {
         serial_println!("timer unavailable — no preemption");

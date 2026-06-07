@@ -72,6 +72,10 @@ struct VirtioBlk {
     desc: u64,        // virt of descriptor table
     avail: u64,       // virt of avail ring
     used: u64,        // virt of used ring
+    desc_phys: u64,   // raw guest-phys of the rings — for a ring-3 DeviceQueue grant (INC7)
+    avail_phys: u64,
+    used_phys: u64,
+    doorbell_phys: u64, // raw MMIO phys of the queue-0 notify doorbell (INC7 ring-3 doorbell)
     hdr_phys: u64,
     data_phys: u64,
     status_phys: u64,
@@ -91,6 +95,10 @@ static mut VBLK: VirtioBlk = VirtioBlk {
     desc: 0,
     avail: 0,
     used: 0,
+    desc_phys: 0,
+    avail_phys: 0,
+    used_phys: 0,
+    doorbell_phys: 0,
     hdr_phys: 0,
     data_phys: 0,
     status_phys: 0,
@@ -156,6 +164,7 @@ pub fn init(hhdm: u64) -> bool {
     let mut common = 0u64;
     let mut notify_base = 0u64;
     let mut notify_mul = 0u32;
+    let mut notify_phys = 0u64; // raw phys base of the notify BAR window (for the INC7 doorbell)
     let mut device_cfg = 0u64;
     // `cap` is a u16 config-space offset so `cap + 16` never overflows (256-byte space;
     // a u8 sum would panic in debug for a cap placed high, or wrap+misread in release).
@@ -182,6 +191,7 @@ pub fn init(hhdm: u64) -> bool {
                 VIRTIO_PCI_CAP_COMMON_CFG => common = va,
                 VIRTIO_PCI_CAP_NOTIFY_CFG => {
                     notify_base = va;
+                    notify_phys = phys;
                     notify_mul = crate::pci::cfg_read32(bus, dev, func, cap + 16);
                 }
                 VIRTIO_PCI_CAP_DEVICE_CFG => device_cfg = va,
@@ -273,6 +283,11 @@ pub fn init(hhdm: u64) -> bool {
         let notify_off = r16(common + CC_QUEUE_NOTIFY_OFF);
         w16(common + CC_QUEUE_ENABLE, 1);
 
+        // The doorbell's RAW MMIO phys: the notify BAR window base + this queue's notify
+        // offset. The kernel writes the doorbell via its HHDM-mapped `notify_base` alias; a
+        // ring-3 driver (INC7) maps `doorbell_phys` NO_CACHE into its own address space.
+        let doorbell_phys = notify_phys + (notify_off as u64) * (notify_mul as u64);
+
         let v = &mut *core::ptr::addr_of_mut!(VBLK);
         v.common = common;
         v.notify_base = notify_base;
@@ -281,6 +296,10 @@ pub fn init(hhdm: u64) -> bool {
         v.desc = desc;
         v.avail = avail;
         v.used = used;
+        v.desc_phys = desc_phys;
+        v.avail_phys = avail_phys;
+        v.used_phys = used_phys;
+        v.doorbell_phys = doorbell_phys;
         v.hdr_phys = buf_phys;
         v.data_phys = buf_phys + 512;
         v.status_phys = buf_phys + 1024;
@@ -435,6 +454,40 @@ pub fn flush() -> bool {
         }
         submit(VIRTIO_BLK_T_FLUSH, 0, false)
     }
+}
+
+/// Physical-address + geometry snapshot of virtio-blk queue 0, for granting a DeviceQueue
+/// cap to a ring-3 driver domain (INC7 zero-kernel I/O). All ring/buffer addresses are RAW
+/// guest-physical (`frame * 4096`) — what a ring-3 driver writes into descriptor `addr`
+/// fields; `doorbell_phys` is the MMIO notify address (mapped NO_CACHE). The request buffer is
+/// `buf_phys`: hdr@+0 (16B), data@+512 (512B), status@+1024 (1B).
+#[derive(Clone, Copy)]
+pub struct DeviceQueueDesc {
+    pub desc_phys: u64,
+    pub avail_phys: u64,
+    pub used_phys: u64,
+    pub buf_phys: u64,
+    pub doorbell_phys: u64,
+    pub qsize: u16,
+}
+
+/// Snapshot queue 0's physical layout for a DeviceQueue grant, or `None` if the device is not
+/// ready. The kernel uses queue 0 only pre-`sti` (boot self-tests); after `sti` it is free for
+/// a trusted ring-3 driver domain to own — so this hand-off is contention-free in v0.
+pub fn device_queue_desc() -> Option<DeviceQueueDesc> {
+    // SAFETY: single-CPU, IRQs off; shared read of VBLK.
+    let v = unsafe { &*core::ptr::addr_of!(VBLK) };
+    if !v.present {
+        return None;
+    }
+    Some(DeviceQueueDesc {
+        desc_phys: v.desc_phys,
+        avail_phys: v.avail_phys,
+        used_phys: v.used_phys,
+        buf_phys: v.hdr_phys,
+        doorbell_phys: v.doorbell_phys,
+        qsize: v.qsize,
+    })
 }
 
 /// Increment-2 smoke test: init the device and read LBA 0, printing the pre-seeded magic.

@@ -65,6 +65,26 @@ pub const X_READ: u16 = 1;
 pub const X_WRITE: u16 = 2;
 pub const X_COMMIT: u16 = 3;
 
+/// Method IDs for the DeviceQueue object kind (Phase 3 INC7 zero-kernel I/O — the namesake
+/// pillar-4 milestone). `DQ_INFO` (needs INVOKE|READ) echoes the device queue size;
+/// `DQ_MAP` (needs INVOKE|**MAP** — the FIRST live use of `Rights::MAP`) maps the virtqueue
+/// rings + a NO_CACHE doorbell page contiguously into the calling (trusted driver) domain at
+/// [`DQ_BASE`] and returns that base USER VA; `DQ_REPORT` (needs INVOKE|WRITE) is the v0
+/// proof channel — a ring-3 driver reports its zero-syscall I/O result and the kernel
+/// validates it against the seeded expectation (NOT a kernel-mediated submit — that v1
+/// fallback is deferred, see docs/PHASE3.md). Methods are per-kind, so 1/2/3 reuse is fine.
+pub const DQ_INFO: u16 = 1;
+pub const DQ_MAP: u16 = 2;
+pub const DQ_REPORT: u16 = 3;
+
+/// Fixed USER virtual-address base of the DeviceQueue mapping window (INC7). Five contiguous
+/// pages from here: +0x0000 desc (RW), +0x1000 avail (RW), +0x2000 used (RO — the device
+/// writes it via bus-master DMA, not the CPU PTE), +0x3000 request buffer (RW;
+/// hdr@+0/data@+512/status@+1024, params baked at +2048), +0x4000 doorbell (RW, NO_CACHE).
+/// Chosen well above the demo's code/stack region [0x40_0000, 0x80_0000). The ring-3 driver
+/// blob hardcodes this same base — keep them in sync.
+pub const DQ_BASE: u64 = 0x100_0000;
+
 /// The sole "no capability" sentinel for the IPC `xfer` (inbound) and `reply_cptr`
 /// (outbound) slots — equals the userspace `syscall::CPTR_NULL` (0xffff). A real CPtr
 /// is `0..CAP_TABLE_SLOTS`, so 0 is an ordinary, transferable slot — NOT a second null.
@@ -77,8 +97,9 @@ pub const M_GRANT_TIME: u16 = 1;
 /// Number of protection domains (one CapTable each). Domain 0 is the root/kernel
 /// domain; the rest are assigned to ring-3 tasks (domain id is independent of task
 /// index). Fully used by the current demo: 0=root, 1=client, 2=server, 3=transient
-/// GRANT_CAP-negative-test domain, 4=crash-only faulter. Bump when adding domains.
-pub const MAX_DOMAINS: usize = 5;
+/// GRANT_CAP-negative-test domain, 4=crash-only faulter, 5=trusted virtio driver (INC7).
+/// Bump when adding domains.
+pub const MAX_DOMAINS: usize = 6;
 
 /// Global ObjectTable (shared object namespace; lazily initialized — proven path).
 static OBJECTS: Once<Mutex<ObjectTable>> = Once::new();
@@ -146,6 +167,36 @@ const EXT_EMPTY: ExtentMeta = ExtentMeta { lba: 0, len: 0, hash: 0 };
 /// Per-Extent side-table. const static-init (no boot-stack temporary).
 /// SAFETY contract: single-CPU, accessed only with interrupts off (see module docs).
 static mut EXTENTS: [ExtentMeta; OBJECT_TABLE_SIZE] = [EXT_EMPTY; OBJECT_TABLE_SIZE];
+
+/// Per-DeviceQueue metadata payload, indexed by `object_id` (Phase 3 INC7). cap-core's
+/// `ObjectMeta` is frozen, so the virtqueue's RAW guest-physical ring/buffer/doorbell
+/// addresses (what `DQ_MAP` maps and what a ring-3 driver writes into descriptor `addr`
+/// fields), the negotiated queue size, and the v0 proof-validation state (`magic` expected at
+/// `scratch_lba`) all live here — mirroring [`EXTENTS`]/[`NOTIFY`]/[`ENDPOINTS`].
+#[derive(Clone, Copy)]
+struct DqMeta {
+    desc_phys: u64,
+    avail_phys: u64,
+    used_phys: u64,
+    buf_phys: u64,
+    doorbell_phys: u64, // absolute MMIO doorbell phys; page = & !0xfff, sub-page offset = & 0xfff
+    qsize: u16,
+    magic: u64,      // value the kernel seeded at `scratch_lba` (DQ_REPORT validation)
+    scratch_lba: u64, // the sector the driver reads for the zero-syscall I/O proof
+}
+const DQ_EMPTY: DqMeta = DqMeta {
+    desc_phys: 0,
+    avail_phys: 0,
+    used_phys: 0,
+    buf_phys: 0,
+    doorbell_phys: 0,
+    qsize: 0,
+    magic: 0,
+    scratch_lba: 0,
+};
+/// Per-DeviceQueue side-table. const static-init (no boot-stack temporary).
+/// SAFETY contract: single-CPU, accessed only with interrupts off (see module docs).
+static mut DEVQUEUES: [DqMeta; OBJECT_TABLE_SIZE] = [DQ_EMPTY; OBJECT_TABLE_SIZE];
 
 /// Throttle for endpoint proof prints.
 static EP_REPORTS: AtomicU64 = AtomicU64::new(0);
@@ -273,6 +324,9 @@ fn dispatch_method(kind: ObjectKind, oid: u64, rights: Rights, method: u16, arg:
         (ObjectKind::Notification, N_POLL) => Rights::READ,
         (ObjectKind::Extent, X_READ) => Rights::READ,
         (ObjectKind::Extent, X_WRITE) | (ObjectKind::Extent, X_COMMIT) => Rights::WRITE,
+        (ObjectKind::DeviceQueue, DQ_INFO) => Rights::READ,
+        (ObjectKind::DeviceQueue, DQ_MAP) => Rights::MAP, // FIRST live use of Rights::MAP
+        (ObjectKind::DeviceQueue, DQ_REPORT) => Rights::WRITE,
         _ => Rights::empty(),
     };
     if !rights.contains(extra) {
@@ -318,6 +372,12 @@ fn dispatch_method(kind: ObjectKind, oid: u64, rights: Rights, method: u16, arg:
             };
             (Status::Ok, h)
         }
+        // DeviceQueue (INC7 zero-kernel I/O): INFO echoes qsize; MAP maps the rings+doorbell
+        // into the trusted driver domain (first live Rights::MAP); REPORT validates the driver's
+        // zero-syscall I/O result. Rights enforced by the `extra` gate above.
+        (ObjectKind::DeviceQueue, DQ_INFO) => (Status::Ok, devqueue_qsize(oid)),
+        (ObjectKind::DeviceQueue, DQ_MAP) => devqueue_map(oid),
+        (ObjectKind::DeviceQueue, DQ_REPORT) => devqueue_report(oid, arg),
         // Extent X_WRITE/X_COMMIT: WRITE was enforced above, but the content-addressed write
         // path needs the bytes, which arrive via Extent MAP in INC7. So a rights-valid write
         // falls through to ErrMethod here (the rights gate is proven; the write path is not
@@ -737,6 +797,98 @@ pub fn extent_metadata(domain: usize, cptr: u16) -> Option<(u64, u32, u64)> {
     // SAFETY: single-CPU, IRQs off; shared read of EXTENTS.
     let m = unsafe { (*core::ptr::addr_of!(EXTENTS))[i] };
     Some((m.lba, m.len, m.hash))
+}
+
+/// Create a DeviceQueue object naming virtio-blk queue 0 (Phase 3 INC7) and mint a root cap:
+/// rights = INVOKE|READ|WRITE|MAP|DELEGATE. The queue's RAW guest-phys ring/buffer/doorbell
+/// addresses + negotiated size come from `virtio_blk::device_queue_desc`; `magic`/`scratch_lba`
+/// are the kernel-seeded proof expectation the `DQ_REPORT` handler validates. Returns the root
+/// CPtr, or `None` if the device isn't ready or the object table is full.
+pub fn create_device_queue(magic: u64, scratch_lba: u64) -> Option<u16> {
+    let dqd = crate::virtio_blk::device_queue_desc()?;
+    let mut objs_g = objects().lock();
+    // SAFETY: single-CPU, IRQs off; sole accessor of DOMAINS in this region.
+    let doms = unsafe { &mut *core::ptr::addr_of_mut!(DOMAINS) };
+    let oid = objs_g.create_object(ObjectKind::DeviceQueue)?;
+    let i = oid as usize;
+    if i >= OBJECT_TABLE_SIZE {
+        return None;
+    }
+    // SAFETY: single-CPU, IRQs off; sole writer of DEVQUEUES[oid] at mint.
+    unsafe {
+        (*core::ptr::addr_of_mut!(DEVQUEUES))[i] = DqMeta {
+            desc_phys: dqd.desc_phys,
+            avail_phys: dqd.avail_phys,
+            used_phys: dqd.used_phys,
+            buf_phys: dqd.buf_phys,
+            doorbell_phys: dqd.doorbell_phys,
+            qsize: dqd.qsize,
+            magic,
+            scratch_lba,
+        };
+    }
+    let rights = Rights::INVOKE | Rights::READ | Rights::WRITE | Rights::MAP | Rights::DELEGATE;
+    doms.tables[0].mint(&*objs_g, oid, rights, 0).ok()
+}
+
+/// Read a DeviceQueue's negotiated queue size (the `DQ_INFO` reply).
+fn devqueue_qsize(oid: u64) -> u64 {
+    let i = oid as usize;
+    if i >= OBJECT_TABLE_SIZE {
+        return 0;
+    }
+    // SAFETY: single-CPU, IRQs off; `i` bounds-checked; shared read of DEVQUEUES.
+    unsafe { (*core::ptr::addr_of!(DEVQUEUES))[i].qsize as u64 }
+}
+
+/// `DQ_MAP` work arm (FIRST live use of `Rights::MAP`, gated upstream): map the virtqueue rings
+/// + request buffer + NO_CACHE doorbell page contiguously at [`DQ_BASE`] into the single shared
+/// address space, USER-accessible, and return the base VA. desc/avail/buf are RW; `used` is RO
+/// (the device writes it via bus-master DMA to `used_phys`, independent of the CPU PTE); the
+/// doorbell is RW + NO_CACHE. All five pages are NX (pure data).
+///
+/// SECURITY (no IOMMU + one shared address space): a writable mapped ring frame is
+/// write-anywhere DMA AND reachable by every ring-3 task — this is granted ONLY to a trusted
+/// driver domain, enforced by capability distribution, not the MMU (see docs/PHASE3.md).
+fn devqueue_map(oid: u64) -> (Status, u64) {
+    let i = oid as usize;
+    if i >= OBJECT_TABLE_SIZE {
+        return (Status::ErrBadCPtr, 0);
+    }
+    // SAFETY: single-CPU, IRQs off; `i` bounds-checked; shared read of DEVQUEUES.
+    let m = unsafe { (*core::ptr::addr_of!(DEVQUEUES))[i] };
+    if m.buf_phys == 0 {
+        return (Status::ErrMethod, 0); // not a seeded device queue
+    }
+    let hhdm = crate::memory::hhdm_offset();
+    let ok = crate::paging::map_user_phys(hhdm, DQ_BASE, m.desc_phys, true, false, false)
+        && crate::paging::map_user_phys(hhdm, DQ_BASE + 0x1000, m.avail_phys, true, false, false)
+        && crate::paging::map_user_phys(hhdm, DQ_BASE + 0x2000, m.used_phys, false, false, false)
+        && crate::paging::map_user_phys(hhdm, DQ_BASE + 0x3000, m.buf_phys, true, false, false)
+        && crate::paging::map_user_phys(hhdm, DQ_BASE + 0x4000, m.doorbell_phys, true, false, true);
+    if ok {
+        (Status::Ok, DQ_BASE)
+    } else {
+        (Status::ErrMethod, 0)
+    }
+}
+
+/// `DQ_REPORT` work arm (v0 proof channel): a ring-3 driver reports the first 8 bytes it read
+/// from `scratch_lba` via its ZERO-syscall virtqueue I/O. The kernel compares against the magic
+/// it seeded there and prints the headline T1 proof line. `reported` is the driver's `arg0`.
+fn devqueue_report(oid: u64, reported: u64) -> (Status, u64) {
+    let i = oid as usize;
+    if i >= OBJECT_TABLE_SIZE {
+        return (Status::ErrBadCPtr, 0);
+    }
+    // SAFETY: single-CPU, IRQs off; `i` bounds-checked; shared read of DEVQUEUES.
+    let m = unsafe { (*core::ptr::addr_of!(DEVQUEUES))[i] };
+    let matched = reported == m.magic;
+    crate::serial_println!(
+        "devqueue: ring3 driver completed virtio READ of LBA {} with ZERO syscalls; reported magic={:#x} kernel-seeded={:#x} match={}",
+        m.scratch_lba, reported, m.magic, matched
+    );
+    (Status::Ok, matched as u64)
 }
 
 /// Admission gate: the ROOT-domain cap at `cptr` must validate via the VERIFIED

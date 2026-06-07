@@ -86,6 +86,83 @@ core::arch::global_asm!(
     "    ud2",                 // deliberate invalid opcode => #UD => crash-only terminate
     ".global faulter_main_end",
     "faulter_main_end:",
+    // ---- virtio driver (domain 5, INC7): ZERO-syscall block I/O over a granted DeviceQueue --
+    // The kernel has already DQ_MAP'd the virtqueue rings + buffer + doorbell at DQ_BASE
+    // (0x100_0000) and baked params into the buffer tail (buf_va+2048): [0]=buf_phys,
+    // [8]=scratch_lba, [16]=qsize, [24]=doorbell_off. This blob replicates virtio_blk::submit
+    // for a single-sector READ of scratch_lba — building the descriptor chain, publishing
+    // avail, ringing the doorbell, polling used — entirely via the mapped USER pages with NO
+    // syscalls, then makes ONE cap_invoke(DQ_REPORT) so the kernel can validate + log the proof.
+    // DUAL ADDRESSING: descriptor addr fields are RAW guest-phys (buf_phys from params); every
+    // pointer dereference uses the USER VA (rbp-relative). rbp = DQ_BASE throughout (PIC).
+    ".global driver_main",
+    ".p2align 4",
+    "driver_main:",
+    "    mov rbx, rdi",                       // rbx = DeviceQueue cptr (slot 0); survives syscall
+    "    mov rbp, 0x1000000",                 // rbp = DQ_BASE (keep in sync with capspace::DQ_BASE)
+    "    mov r12, [rbp+0x3800]",              // r12 = buf_phys  (params @ buf_va+2048)
+    "    mov r13, [rbp+0x3808]",              // r13 = scratch_lba
+    "    mov r14, [rbp+0x3810]",              // r14 = qsize (low 16 used)
+    "    mov r15, [rbp+0x3818]",              // r15 = doorbell sub-page offset
+    // desc0 (hdr): addr=buf_phys, len=16, flags=NEXT(1), next=1
+    "    mov [rbp+0x00], r12",
+    "    mov dword ptr [rbp+0x08], 16",
+    "    mov word ptr [rbp+0x0c], 1",
+    "    mov word ptr [rbp+0x0e], 1",
+    // desc1 (data): addr=buf_phys+512, len=512, flags=NEXT|WRITE(3) (device writes — it's a read), next=2
+    "    lea rax, [r12+512]",
+    "    mov [rbp+0x10], rax",
+    "    mov dword ptr [rbp+0x18], 512",
+    "    mov word ptr [rbp+0x1c], 3",
+    "    mov word ptr [rbp+0x1e], 2",
+    // desc2 (status): addr=buf_phys+1024, len=1, flags=WRITE(2), next=0
+    "    lea rax, [r12+1024]",
+    "    mov [rbp+0x20], rax",
+    "    mov dword ptr [rbp+0x28], 1",
+    "    mov word ptr [rbp+0x2c], 2",
+    "    mov word ptr [rbp+0x2e], 0",
+    // request header @ buf_va (rbp+0x3000): type=VIRTIO_BLK_T_IN(0), reserved=0, sector=scratch_lba
+    "    mov dword ptr [rbp+0x3000], 0",
+    "    mov dword ptr [rbp+0x3004], 0",
+    "    mov [rbp+0x3008], r13",
+    "    mov byte ptr [rbp+0x3400], 0xff",    // status (buf+1024) = 0xFF (device overwrites with 0)
+    // publish avail (rbp+0x1000): ring[avail_idx % qsize] = head desc 0; idx = avail_idx + 1
+    "    movzx eax, word ptr [rbp+0x1002]",   // eax = avail_idx
+    "    mov ecx, eax",                        // ecx = avail_idx (saved)
+    "    xor edx, edx",                        // dividend high = 0
+    "    div r14w",                            // dx = avail_idx % qsize (slot); ax = quotient
+    "    movzx r9d, dx",                       // r9 = slot
+    "    mov word ptr [rbp+r9*2+0x1004], 0",   // avail.ring[slot] = 0
+    "    lea eax, [ecx+1]",                    // target = avail_idx + 1
+    "    mov word ptr [rbp+0x1002], ax",       // avail.idx = target
+    "    mov ecx, eax",                        // ecx = target (poll compare)
+    // ring doorbell (rbp+0x4000 + doorbell_off): 16-bit store of queue index 0 (NO_CACHE page)
+    "    lea r10, [rbp+r15+0x4000]",
+    "    mov word ptr [r10], 0",
+    // poll used.idx (rbp+0x2002) until == target, BOUNDED (a mis-mapped doorbell must not spin
+    // forever — on timeout we still report, so the proof line always prints, just match=false)
+    "    mov r11, 100000000",                  // poll bound (caller-saved; only used pre-syscall)
+    "3:",
+    "    movzx eax, word ptr [rbp+0x2002]",
+    "    cmp ax, cx",
+    "    je 4f",
+    "    pause",
+    "    dec r11",
+    "    jnz 3b",
+    "4:",
+    // read back the first 8 bytes the device DMA'd into data (buf+512 = rbp+0x3200)
+    "    mov rdx, [rbp+0x3200]",               // arg0 = magic read from disk (or sentinel on timeout)
+    // ONE syscall: cap_invoke(dq, DQ_REPORT=3, arg0=magic) — the kernel validates + logs
+    "    mov rax, 1",                          // SYS_CAP_INVOKE
+    "    mov rdi, rbx",                        // cptr = DeviceQueue
+    "    mov rsi, 3",                          // method = DQ_REPORT
+    "    xor r10d, r10d",
+    "    xor r8d, r8d",
+    "    mov r9, 0xffff",                      // xfer = CPTR_NULL
+    "    syscall",
+    "    ud2",                                 // done — v0 has no voluntary-exit syscall (crash-only reap)
+    ".global driver_main_end",
+    "driver_main_end:",
 );
 
 extern "C" {
@@ -95,6 +172,8 @@ extern "C" {
     pub fn server_main_end();
     pub fn faulter_main();
     pub fn faulter_main_end();
+    pub fn driver_main();
+    pub fn driver_main_end();
 }
 
 /// Map a read-only executable user code page at `code_va` and a writable NX user stack

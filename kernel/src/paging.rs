@@ -288,3 +288,48 @@ pub fn map_user_page(hhdm: u64, virt: u64, writable: bool, exec: bool) -> Option
     debug_assert!(!(writable && exec));
     Some(fnum)
 }
+
+/// Map an ALREADY-ALLOCATED physical frame `phys` at user VA `virt`, USER-accessible, WITHOUT
+/// allocating or zeroing (unlike [`map_user_page`]) — the frame holds LIVE data (a virtqueue
+/// ring, an MMIO doorbell, or extent bytes), so zeroing would corrupt it. `writable` adds
+/// WRITABLE; `exec=false` adds NO_EXECUTE; `no_cache` adds PCD (for the MMIO doorbell page,
+/// matching `map_mmio`). Intermediate tables are created USER too (the U/S bit is AND-ed down
+/// the walk, so leaf-only USER would still #PF in ring 3). Returns true on success, false if
+/// `virt` is already mapped or an intermediate table could not be allocated.
+///
+/// SAFETY: single-CPU, interrupts off; `virt` is a user VA not already mapped; `phys` is a
+/// frame the caller intends to expose to ring 3. NOTE the trust boundary: with no IOMMU and a
+/// single shared address space, a writable ring frame mapped here is write-anywhere DMA and is
+/// reachable by every ring-3 task — grant only to a TRUSTED driver domain (see docs/PHASE3.md).
+pub fn map_user_phys(hhdm: u64, virt: u64, phys: u64, writable: bool, exec: bool, no_cache: bool) -> bool {
+    // W^X invariant: never simultaneously writable and executable (INC7 mappings are NX data).
+    debug_assert!(!(writable && exec));
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt & !0xfff));
+    let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys & !0xfff));
+    let mut mapper = unsafe { active_mapper(hhdm) };
+    let mut frames = KernelFrames;
+    let mut leaf = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if writable {
+        leaf |= PageTableFlags::WRITABLE;
+    }
+    if !exec {
+        leaf |= PageTableFlags::NO_EXECUTE;
+    }
+    if no_cache {
+        leaf |= PageTableFlags::NO_CACHE;
+    }
+    // CRITICAL: parents must also be USER (and PRESENT|WRITABLE) or the walk denies ring 3.
+    let parent =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    // SAFETY: mapping an existing physical frame to a user VA; flush after. We do NOT zero —
+    // the frame holds live ring/MMIO/extent data.
+    unsafe {
+        match mapper.map_to_with_table_flags(page, frame, leaf, parent, &mut frames) {
+            Ok(f) => {
+                f.flush();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
