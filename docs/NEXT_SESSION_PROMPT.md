@@ -34,7 +34,8 @@ panic/fault anywhere):
   X_MAP=>Ok va=0x1100000; mapped-bytes hash == committed 0x7b4ded… match=true; MAP-masked
   X_MAP=>ErrRights`; and the INC6 recovery proof `objstore:
   recovered root Extent cptr=0 lba=L … objects-survive-reboot=true` (or `no committed root to recover
-  (fresh store)` on the first boot after `rm`); and the INC7 zero-kernel I/O proof `devqueue: DQ_MAP
+  (fresh store)` on the first boot after `rm`); the INC8 `devqueue: MAP-less cap DQ_SUBMIT(LBA 32700)
+  => Some((Ok, ...)) ... content-hash match=true`; and the INC7 zero-kernel I/O proof `devqueue: DQ_MAP
   (first live Rights::MAP) => Ok base=0x1000000; MAP-masked copy DQ_MAP => Some(ErrRights)` then
   `devqueue: ring3 driver completed virtio READ of LBA 32700 with ZERO syscalls; reported magic=…07
   kernel-seeded=…07 match=true`, then `domain 5 (task 4) terminated: #UD …` (driver's clean v0 exit),
@@ -57,19 +58,25 @@ panic/fault anywhere):
   a ring-3 driver does a full virtio-blk READ with ZERO syscalls over a granted DeviceQueue cap),
   INC7b Extent MAP ✅ (second live `Rights::MAP`: a committed extent's persisted bytes mapped RO into
   a domain, re-hash == committed hash), INC7c reap teardown ✅ (a reaped domain's DQ_MAP/X_MAP pages are
-  unmapped — the DMA window is closed; unmap-only, frames are object-owned). Each subtle increment went
-  through a design and/or adversarial panel. **BOTH Phase-3 theses hold — T1 (kernel out of the I/O
-  path) + T2 (objects survive reboot) — the Extent + DeviceQueue capability models are complete, and
-  reap teardown closes the DMA-mapping leak.** Last feature commit: `82980f9`.
+  unmapped — the DMA window is closed; unmap-only, frames are object-owned), INC8 DQ_SUBMIT ✅
+  (kernel-mediated, DMA-contained block I/O — the escalation-ladder v1 rung; a MAP-less DeviceQueue cap
+  gets safe I/O without a write-anywhere ring). Plus the `frame-alloc` Kani proofs now PASS (were
+  hanging; fixed FRAMES=8 + unwind) — so BOTH verified crates (cap-core + frame-alloc) are green. Each
+  subtle increment went through a design and/or adversarial panel. **BOTH Phase-3 theses hold — T1
+  (kernel out of the I/O path) + T2 (objects survive reboot); the Extent + DeviceQueue capability
+  models are complete; the DMA-mapping leak is closed; the v1 contained-I/O fallback exists.** Last
+  feature commit: `84093f4` (INC8 is `316089f`).
 
-## STEP 3 — Your task: optional escalation rungs OR pivot to Phase 4
-Phase 3's CORE IS COMPLETE (T1+T2 proven; Extent + DeviceQueue models done; reap teardown done). What
-remains is optional hardening + the next phase — **confirm direction with the user** (they may prefer
-Phase 4, or a different priority). cap-core stays byte-unchanged. Candidate work:
-- **Escalation rungs / DMA containment:** `DQ_SUBMIT` kernel-validated descriptors (the v1 step — the
-  kernel checks each descriptor addr ∈ the DeviceQueue's owned frames); IRQ completion (`IrqHandler`
-  + `Notification` instead of polling); VT-d/intel-iommu scaffold (the real per-domain DMA-containment
-  fix; QEMU q35 can model `intel-iommu`). See `docs/PHASE3.md` + the DMA-trust-boundary escalation ladder.
+## STEP 3 — Your task: IRQ-driven I/O OR pivot to Phase 4 (confirm direction with the user)
+Phase 3's CORE + the v1 escalation rung + both crates' Kani proofs are DONE. The cleanly-completable
+non-hardware work is essentially finished. What remains is LARGER subsystems or HW-dependent work —
+**confirm direction with the user first.** Candidate work:
+- **IRQ-driven I/O (largest QEMU-doable piece):** replace the polled completion with an interrupt —
+  needs IOAPIC or MSI-X setup (only the LAPIC timer is wired today), the `IrqHandler` object kind
+  (defined in cap-core, unused), routing completion to a `Notification`, and a blocking `N_WAIT` so
+  the driver parks instead of spins. Substantial new infrastructure but pure QEMU.
+- **VT-d / intel-iommu scaffold:** the real per-domain DMA-containment fix (QEMU q35 models
+  `intel-iommu`); large, and best validated on real hardware. See the DMA-trust-boundary ladder.
 - **Object lifecycle:** object-destroy/revoke + frame reclamation (the deferred frame-free path — the
   Extent data frame + a destroyed DeviceQueue's rings currently leak for the boot's lifetime).
 - **Phase 4 alternative:** network-boot onto James's HPE ProLiant via the existing iPXE server; the
@@ -135,7 +142,8 @@ management plane + TCB verification. Thesis: *everything is a capability over on
 substrate, and the kernel gets out of the data path.* Phase 3 makes that real (Extent caps over a
 log-structured store; DeviceQueue caps for kernel-free I/O at INC7).
 
-Start by reading `RESUME.md`, confirming the clean boot, then (Phase-3 core is complete) confirm with
-the user whether to do the optional escalation/DMA-containment rungs, the object-lifecycle frame
-reclamation, or pivot to Phase 4. Ask me nothing you can answer from the repo — but do confirm
-direction before any large multi-agent workflow run.
+Start by reading `RESUME.md`, confirming the clean boot, then (Phase-3 core + v1 escalation + both
+crates' Kani proofs are complete) confirm with the user whether to build IRQ-driven I/O (the largest
+remaining QEMU-doable piece), a VT-d scaffold, object-lifecycle frame reclamation, or pivot to Phase 4
+(real hardware). Ask me nothing you can answer from the repo — but do confirm direction before any
+large multi-agent workflow run.

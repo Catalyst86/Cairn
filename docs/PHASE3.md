@@ -167,11 +167,21 @@ CPtrs are ephemeral — sealed sparse 128-bit persisted tokens are CAP_ABI §7, 
   mapping-owned and freed it on reap — a latent double-free/UAF (it is object-owned); FIXED by the
   unmap-only design. Queue-0 reset on driver death is deferred (nothing reuses queue 0 after a driver
   dies in v0).
-- **NEXT (optional) — escalation rungs OR Phase 4:** `DQ_SUBMIT` kernel-validated descriptors (the
-  v1 DMA-containment-lite step); IRQ completion (`IrqHandler` + `Notification` instead of polling);
-  VT-d/`intel-iommu` scaffold (the real DMA-containment fix); object-destroy + frame reclamation (the
-  deferred frame-free path). **Or pivot to Phase 4** (real-hardware network-boot + SMP/ACPI retrofit)
-  — Phase 3's core is complete (T1+T2; Extent + DeviceQueue models; reap teardown).
+- **INC8 — DQ_SUBMIT (kernel-mediated, DMA-contained block I/O) ✅ DONE** (commit `316089f`;
+  `capspace.rs`, `main.rs`). The DMA-trust escalation ladder's v1 rung + completes the DeviceQueue
+  method set (INFO/MAP/REPORT/SUBMIT). `DQ_SUBMIT` (needs INVOKE|WRITE) reads a block into the
+  kernel's OWN buffer — never a domain-named frame — and returns the bytes' content hash, so an
+  UNTRUSTED domain (a DeviceQueue cap with WRITE but no MAP) gets safe block I/O without `DQ_MAP`'s
+  write-anywhere-DMA exposure. The same MAP-less cap demonstrates both: refused `DQ_MAP` (ErrRights),
+  allowed `DQ_SUBMIT` (Ok + content hash). v0 limit: single global queue 0, so it must not run
+  concurrently with a `DQ_MAP`-ed driver that owns the queue (the demo runs it pre-`sti`) —
+  per-queue isolation for concurrent runtime use needs multi-queue (with the IRQ work).
+- **NEXT (optional, larger) — IRQ-driven I/O OR Phase 4:** IRQ completion (`IrqHandler` +
+  `Notification` instead of polling — needs IOAPIC/MSI-X setup + a blocking `N_WAIT`); VT-d/
+  `intel-iommu` scaffold (the real per-domain DMA-containment fix, best validated on real HW);
+  object-destroy + refcounted frame reclamation (the deferred frame-free path). **Or pivot to Phase
+  4** (real-hardware network-boot + the big SMP/ACPI/NUMA retrofit). Phase 3's core + the v1
+  escalation rung are complete.
 
 ## QEMU / disk setup (in `C:\WSL\cairn-go-kernel.sh`, NOT the repo)
 A persistent **16 MiB raw disk** `/root/cairn-disk.img` (created once via `truncate` — `qemu-img`

@@ -42,7 +42,8 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    content hash + flush) ✅ · INC5 (append-log `put` + content-addressed Extent caps) ✅ · INC6
    (objects survive reboot — T2 milestone) ✅ · INC7 (zero-kernel DeviceQueue I/O — T1 milestone, first
    live Rights::MAP) ✅ · INC7b (Extent MAP — persisted bytes into a domain, second live Rights::MAP)
-   ✅ · INC7c (reap teardown — unmap a dead domain's grants) ✅.** BOTH Phase-3 theses hold (T1 kernel
+   ✅ · INC7c (reap teardown — unmap a dead domain's grants) ✅ · INC8 (DQ_SUBMIT — kernel-mediated,
+   DMA-contained block I/O) ✅.** BOTH Phase-3 theses hold (T1 kernel
    out of the I/O hot path + T2 objects survive reboot), the Extent + DeviceQueue capability models are
    complete, and a reaped driver's DMA mapping is now torn down. The L2 block layer
    (`virtio_blk::read_sector`/`write_sector`/`flush`, one shared `submit()`), the L3 superblock
@@ -95,20 +96,35 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    domain 5 torn down — unmapped 5/5 granted page(s)`. Adversarial review (5 findings, 1 confirmed):
    the draft wrongly tagged the Extent frame mapping-owned + freed it on reap (latent double-free/UAF
    — it is object-owned); FIXED by unmap-only.
-   **NEXT (optional) = escalation rungs OR Phase 4.** `DQ_SUBMIT` kernel-validated descriptors; IRQ
-   completion (`IrqHandler` + `Notification` instead of polling); VT-d/`intel-iommu` scaffold (real
-   DMA containment); object-destroy + frame reclamation (the deferred frame-free path). **Or pivot to
-   Phase 4** (network-boot onto the real HPE ProLiant; the big SMP/ACPI/NUMA retrofit). Phase 3's core
-   is complete (T1+T2; Extent + DeviceQueue models; reap teardown). cap-core byte-unchanged.
+   **INC8 (done, commit `316089f`):** `DQ_SUBMIT=4` (needs INVOKE|WRITE) — the DMA-trust escalation
+   ladder's v1 rung + completes the DeviceQueue method set. The kernel reads a block into its OWN
+   buffer (never a domain-named frame) and returns the content hash, so an UNTRUSTED domain (a
+   DeviceQueue cap with WRITE but no MAP) gets safe block I/O without `DQ_MAP`'s write-anywhere-DMA.
+   The same MAP-less cap is refused `DQ_MAP` (ErrRights) but allowed `DQ_SUBMIT` (Ok + hash). v0:
+   single queue 0 (demo pre-`sti`); per-queue isolation for concurrent runtime use needs multi-queue.
+   **frame-alloc Kani (done, commit `84093f4`):** the 4 frame-alloc proofs now PASS (were hanging
+   CBMC at FRAMES=128). Fix = FRAMES 128→8 + `#[kani::unwind(10)]` in the proof harness only
+   (`crates/frame-alloc/src/verification.rs`); allocator logic + cap-core byte-unchanged. Re-run via
+   `wsl.exe -d Ubuntu -- bash /mnt/c/WSL/frame-alloc-kani.sh` (0.22s, "VERIFICATION:- SUCCESSFUL").
+   **NEXT (optional, larger) = IRQ-driven I/O OR Phase 4.** IRQ completion (`IrqHandler` +
+   `Notification` instead of polling — needs IOAPIC/MSI-X + a blocking `N_WAIT`); VT-d/`intel-iommu`
+   scaffold (real per-domain DMA containment, best validated on real HW); object-destroy + refcounted
+   frame reclamation (the deferred frame-free path). **Or pivot to Phase 4** (network-boot onto the
+   real HPE ProLiant; the big SMP/ACPI/NUMA retrofit — needs the server). Phase 3's core + the v1
+   escalation rung + both verified crates' Kani proofs are complete. cap-core byte-unchanged.
    - **Or small Phase-2 polish** (`docs/CRASH_ONLY.md`/`PORTAL_IPC.md` "deferred"):
      survivor-liveness scrub, per-domain frame reclamation on death, blocking `N_WAIT`.
-3. **cap-core stays byte-unchanged** (the regression gate; `git diff HEAD -- crates/` must be
-   empty). NOTE: `kani-proofs.sh` HANGS on the frame-alloc proofs (a prior session left stale
-   `cbmc` running — kill any `cbmc`/`cargo-kani`/`kani-driver` by NAME first: `pkill -9 cbmc`,
-   NOT `-f` which self-matches the kill command). cap-core's 4 proofs already pass; to re-confirm
-   run ONLY `cargo kani -p cap-core --features kani`. At handoff the last FEATURE commit is
-   Phase 3 INC7c (reap teardown) `82980f9` (HEAD is the RESUME-update commit after it;
-   run `git log --oneline -20`).
+3. **cap-core (`crates/cap-core`) stays byte-unchanged** (the regression gate; `git diff HEAD --
+   crates/cap-core/` must be empty — the verified core is frozen). NOTE: `frame-alloc`'s harness was
+   fixed this session (it is NOT frozen), so `git diff HEAD -- crates/` is no longer the gate — use
+   the `cap-core` path. Kani: BOTH verified crates' proofs now pass — cap-core's 4 (re-confirm:
+   `cargo kani -p cap-core --features kani`, ~26 min) and frame-alloc's 4 (re-confirm:
+   `bash /mnt/c/WSL/frame-alloc-kani.sh`, ~0.2s after the FRAMES=8 + unwind fix). `kani-proofs.sh`
+   ran cap-core then frame-alloc; the frame-alloc HANG is FIXED. Reap stale solvers by NAME first
+   (`pkill -9 cbmc`, NOT `-f` which self-matches). When invoking Kani via the PowerShell tool, use a
+   SCRIPT FILE (inline `bash -c` mangles `$HOME`/quotes + lacks `~/.cargo/bin` on PATH). At handoff
+   the last FEATURE commit is `84093f4` (frame-alloc Kani fix; INC8 DQ_SUBMIT is `316089f`). HEAD is
+   the RESUME-update commit after them; run `git log --oneline -25`.
 
 ## Status (Phase 3: zero-kernel I/O + object store — UNDERWAY) 🚧
 - ✅ **INC1 — PCI bus enumeration** (commit `4218ace`; `pci.rs`, `docs/PHASE3.md`). Architected
@@ -197,11 +213,22 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
   → 3-skeptic; 5 findings, 1 confirmed): the draft wrongly tagged the Extent frame mapping-owned and
   freed it on reap (latent double-free/UAF — it is object-owned); FIXED by unmap-only. cap-core
   byte-unchanged; 6 warnings (no new).
-- 🚧 **NEXT (optional) = escalation rungs OR Phase 4.** `DQ_SUBMIT` kernel-validated descriptors; IRQ
-  completion (`IrqHandler` + `Notification` instead of polling); VT-d/`intel-iommu` scaffold (real DMA
-  containment); object-destroy + frame reclamation (the deferred frame-free path). **Or pivot to Phase
-  4** (real HPE ProLiant network-boot; the big SMP/ACPI/NUMA retrofit). Phase 3's core is complete
-  (T1+T2; Extent + DeviceQueue models; reap teardown). `docs/PHASE3.md`.
+- ✅ **INC8 — DQ_SUBMIT (kernel-mediated, DMA-contained block I/O)** (commit `316089f`; `capspace.rs`,
+  `main.rs`). The DMA-trust escalation ladder's v1 rung + completes the DeviceQueue method set. The
+  kernel reads a block into its OWN buffer (never a domain-named frame) and returns the content hash,
+  so an UNTRUSTED domain (DeviceQueue WRITE, no MAP) gets safe I/O without `DQ_MAP`'s write-anywhere
+  DMA. Same MAP-less cap: `DQ_MAP`⇒ErrRights, `DQ_SUBMIT`⇒Ok+hash. Verified pre-`sti`; 6 warnings.
+- ✅ **frame-alloc Kani proofs fixed** (commit `84093f4`; `crates/frame-alloc/src/verification.rs`).
+  The 4 proofs (no-double-alloc, distinct, roundtrip, bounds) PASS — were hanging CBMC at FRAMES=128
+  (the exhaust loop's ~128-deep unwind). Fix = FRAMES 128→8 + `#[kani::unwind(10)]` (harness only;
+  allocator logic + cap-core byte-unchanged). 0.22s, "VERIFICATION:- SUCCESSFUL". Both verified crates
+  green. Re-run: `bash /mnt/c/WSL/frame-alloc-kani.sh`.
+- 🚧 **NEXT (optional, larger) = IRQ-driven I/O OR Phase 4.** IRQ completion (`IrqHandler` +
+  `Notification` instead of polling — needs IOAPIC/MSI-X + blocking `N_WAIT`); VT-d/`intel-iommu`
+  scaffold (real per-domain DMA containment, best validated on real HW); object-destroy + refcounted
+  frame reclamation. **Or pivot to Phase 4** (real HPE ProLiant network-boot; the big SMP/ACPI/NUMA
+  retrofit — needs the server). Phase 3's core + v1 escalation rung + both crates' Kani proofs are
+  complete. `docs/PHASE3.md`.
 
 ## Status (Phase 2: crash-only domain supervision + restart) ✅
 - ✅ **Restart / self-healing** (commit `a1b37bf`; `supervisor.rs`): `terminate_current` calls
@@ -341,8 +368,9 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
   `0x101000`, `demo_revoke_then_invoke => ErrRevoked` — the verified I2 epoch-revocation
   invariant running in the real kernel.
 - ✅ **The paging "map-then-unmap" bug is FIXED** (root cause + fix below).
-- ⏳ `frame-alloc` Kani proofs are NOT confirmed — `kani-proofs.sh` HANGS on them (see the top
-  note); cap-core's 4 proofs DO pass. Re-confirm cap-core alone: `cargo kani -p cap-core --features kani`.
+- ✅ `frame-alloc` Kani proofs PASS (commit `84093f4`; were hanging at FRAMES=128 — fixed with
+  FRAMES=8 + `#[kani::unwind(10)]`). Re-confirm: `bash /mnt/c/WSL/frame-alloc-kani.sh` (~0.2s). cap-core's
+  4 proofs also pass: `cargo kani -p cap-core --features kani` (~26 min). Both verified crates green.
 
 ## THE PAGING BUG — SOLVED (was: "map-then-unmap")
 **The previous diagnosis was WRONG.** It was NOT an unmapped `.bss` tail and NOT
@@ -402,11 +430,11 @@ backstop. Building keystone's own page tables is now OPTIONAL polish, not a bloc
 - **GDB debug:** `wsl.exe -d Ubuntu -- bash /mnt/c/WSL/cairn-gdb.sh [/mnt/c/WSL/<cmds>]`
   (reuses the last-built `cairn.iso`; gdb output via `set logging` → `/root/cairn-gdb*.log`).
 - **Full rebuild (kernel + crates):** `.../cairn-rebuild.sh` ; **whole pipeline:** `.../cairn-go.sh`.
-- **Kani proofs:** `wsl.exe -d Ubuntu -- bash /mnt/c/WSL/kani-proofs.sh` (slow — cap-core
-  took ~26 min; runs `cargo kani -p cap-core --features kani` and `-p frame-alloc`). **WARNING:**
-  it currently HANGS on the `frame-alloc` proofs and leaves stale `cbmc` running — for a quick
-  regression check run only `cargo kani -p cap-core --features kani`, and reap stragglers with
-  `pkill -9 cbmc` (by NAME — `-f` self-matches the kill command).
+- **Kani proofs:** cap-core — `wsl.exe -d Ubuntu -- bash /mnt/c/WSL/kani-proofs.sh` (slow, ~26 min;
+  runs both crates). frame-alloc ALONE (fast, ~0.2s) — `wsl.exe -d Ubuntu -- bash
+  /mnt/c/WSL/frame-alloc-kani.sh`. BOTH crates' proofs now PASS (the old frame-alloc HANG was fixed
+  with FRAMES=8 + `#[kani::unwind(10)]`). Reap stale solvers by NAME first (`pkill -9 cbmc` — `-f`
+  self-matches). Kani scripts must `export PATH="$HOME/.cargo/bin:$PATH"` (an inline `bash -c` lacks it).
 - Filter serial output in PowerShell with `... | Select-String -Pattern "..."` (no `grep`).
 - Helper scripts in `C:\WSL\`: cairn-go-kernel.sh, cairn-rebuild.sh, cairn-go.sh,
   kani-proofs.sh, kani-setup.sh, limine-setup.sh, cairn-gdb.sh, cairn-gdb.cmds,
@@ -449,7 +477,8 @@ crash-only restart / self-healing (supervisor re-admits under a budget) ✅ (Pha
 (INC2) → write round-trip ✅ (INC3) → Cairnlog superblock+hash+flush ✅ (INC4) → append-log
 put + content-addressed Extent caps ✅ (INC5) → objects-survive-reboot ✅ (INC6, T2) → DeviceQueue
 zero-kernel I/O ✅ (INC7, T1, first live Rights::MAP) → Extent MAP ✅ (INC7b, second live MAP) →
-reap teardown ✅ (INC7c, unmap-on-reap) → escalation rungs (DQ_SUBMIT/IRQ/VT-d) OR Phase 4 (NEXT);
+reap teardown ✅ (INC7c, unmap-on-reap) → DQ_SUBMIT ✅ (INC8, contained fallback) → frame-alloc Kani
+✅ → IRQ-driven I/O OR Phase 4 (NEXT);
 see docs/PHASE3.md** → (Phase-3 core complete: T1+T2 hold; Extent + DeviceQueue models; reap teardown)
 Ring-3 follow-ups (deferred, see commits): fair co-scheduling (the demo now co-schedules
 faulter+client+server across domains and works, but equal EDF deadlines are still broken by
@@ -463,8 +492,8 @@ admission utilization check (Σ Cᵢ/Tᵢ≤1), and a way to revoke an *already-
 TimeSlice without cap-core in the ISR hot path.
 Phase 4 (network-boot onto the real HPE ProLiant via James's existing iPXE server; see the
 `studio-server-access` memory) → Phase 5 (confidential boot + beautiful management plane).
-Keep adding Kani proofs per component; finish the `frame-alloc` proofs. Building keystone's
-own page tables is now optional hardening, no longer blocking.
+Keep adding Kani proofs per component (cap-core's 4 + frame-alloc's 4 now both pass). Building
+keystone's own page tables is now optional hardening, no longer blocking.
 
 ## Server (not needed until Phase 4)
 HPE ProLiant, currently OFF. iLO `192.168.99.2` (web, user Administrator, reachable only with
