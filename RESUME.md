@@ -19,9 +19,12 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    -> seq=1` on a fresh `/root/cairn-disk.img`); and the **INC5 extent proof** `extent: put lba=L
    len=59 hash=0x7b4ded… ; X_READ=>Ok reply_hash=0x7b4ded… ; meta=Some((L,59,…)); on-disk
    re-read=Some(…); content-addressed match=true` then `extent: READ-masked cap X_READ=>ErrRights …
-   X_WRITE=>ErrMethod`; and the **INC6 recovery proof** `objstore: recovered root Extent cptr=0 lba=L
-   len=59 hash=0x7b4ded… (on-disk re-hash matched); X_READ=>Ok …; objects-survive-reboot=true` (or
-   `no committed root to recover (fresh store)` on the very first boot after `rm`); and the **INC7
+   X_WRITE=>ErrMethod`; the **INC7b Extent-MAP proof** `extent: X_MAP=>Ok va=0x1100000; mapped-bytes
+   hash=… committed=0x7b4ded… match=true; MAP-masked X_MAP=>ErrRights` (the persisted bytes mapped RO
+   into a domain, re-hash to the committed content hash); the **INC6 recovery proof** `objstore:
+   recovered root Extent cptr=0 lba=L len=59 hash=0x7b4ded… (on-disk re-hash matched); X_READ=>Ok …;
+   objects-survive-reboot=true` (or `no committed root to recover (fresh store)` on the very first boot
+   after `rm`); and the **INC7
    zero-kernel I/O proof** `devqueue: DQ_MAP (first live Rights::MAP) => Ok base=0x1000000; MAP-masked
    copy DQ_MAP => Some(ErrRights)` then `devqueue: ring3 driver completed virtio READ of LBA 32700 with
    ZERO syscalls; reported magic=0xca1707d0dead0007 kernel-seeded=0xca1707d0dead0007 match=true`,
@@ -36,8 +39,9 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    **INC1 (PCI enum) ✅ · INC2 (virtio-blk read) ✅ · INC3 (write) ✅ · INC4 (Cairnlog superblock +
    content hash + flush) ✅ · INC5 (append-log `put` + content-addressed Extent caps) ✅ · INC6
    (objects survive reboot — T2 milestone) ✅ · INC7 (zero-kernel DeviceQueue I/O — T1 milestone, first
-   live Rights::MAP) ✅.** BOTH Phase-3 theses now hold: T1 (kernel out of the I/O hot path) and T2
-   (objects survive reboot). The L2 block layer
+   live Rights::MAP) ✅ · INC7b (Extent MAP — persisted bytes into a domain, second live Rights::MAP)
+   ✅.** BOTH Phase-3 theses now hold (T1 kernel out of the I/O hot path + T2 objects survive reboot),
+   and the Extent + DeviceQueue capability models are complete. The L2 block layer
    (`virtio_blk::read_sector`/`write_sector`/`flush`, one shared `submit()`), the L3 superblock
    (`objstore.rs`: FNV-1a hash, A/B superblock at LBA0/1, format/mount, durable via flush), the **L4
    append-log + Extent caps**, and **reboot recovery** all work; the store PERSISTS across QEMU restarts
@@ -73,12 +77,20 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    mapped writable ring is write-anywhere DMA + reachable by every ring-3 task; trusted-domain-only
    is enforced by capability distribution, not the MMU. `reap_domain` revokes the cap but does NOT
    unmap the DQ_MAP pages (accepted v0 leak).
-   **NEXT = INC7b: Extent MAP + reap teardown.** Map an extent's on-disk data into a domain (DMA the
-   sectors into frame(s), then RO-map via `map_user_phys` — `extent_metadata` is the seed); add a
-   per-domain DQ_MAP/Extent mapping ledger + `unmap`-on-reap + queue-0 reset so a reaped driver
-   doesn't leak a live DMA mapping. Later: `DQ_SUBMIT` kernel-validated descriptors; IRQ completion
-   (IrqHandler + Notification); VT-d scaffold. Full plan in `docs/PHASE3.md` INC7b. cap-core
-   byte-unchanged. **Or Phase 4** (network-boot onto the real HPE ProLiant; SMP/ACPI retrofit) — both
+   **INC7b (done, commit `02dc95e`):** `objstore::load_extent` DMAs a committed extent's sectors into a
+   fresh RAM frame (pre-`sti`; v0 single-frame ≤4096B; frees the frame on a block error);
+   `capspace`: `ExtentMeta.data_frame_phys`, `mint_extent_mapped`, `X_MAP=4` +
+   `(Extent,X_MAP)=>Rights::MAP` + `extent_map` (maps the frame RO+NX at `EXTENT_MAP_BASE=0x110_0000`).
+   The boot self-test reads the mapped bytes and confirms `fnv1a == the committed hash`
+   (`X_MAP=>Ok va=0x1100000 … match=true`; MAP-masked ⇒ ErrRights). Adversarial review (3 finders →
+   3-skeptic; 4 findings, 0 confirmed). Fulfils the Extent "bytes via MAP, never a register" promise.
+   **NEXT (Phase-3 hardening, optional) = reap teardown + escalation rungs.** `reap_domain` revokes a
+   dead driver's caps but does NOT unmap its `DQ_MAP`/`X_MAP` pages (accepted v0 leak) — add a
+   per-domain mapping ledger + `unmap`-on-reap + queue-0 reset (SUBTLE: frame-ownership asymmetry —
+   DeviceQueue frames device-owned ⇒ unmap-only; Extent scratch frames mapping-owned ⇒ unmap +
+   `deallocate_frame`). Later: `DQ_SUBMIT` kernel-validated descriptors; IRQ completion; VT-d scaffold.
+   Full plan in `docs/PHASE3.md`. cap-core byte-unchanged. **Or Phase 4** (network-boot onto the real
+   HPE ProLiant; SMP/ACPI retrofit) — Phase 3's core is complete, so this is a natural pivot. Both
    Phase-3 theses (T1+T2) now hold, so Phase 3's core is essentially complete.
    - **Or small Phase-2 polish** (`docs/CRASH_ONLY.md`/`PORTAL_IPC.md` "deferred"):
      survivor-liveness scrub, per-domain frame reclamation on death, blocking `N_WAIT`.
@@ -87,7 +99,7 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    `cbmc` running — kill any `cbmc`/`cargo-kani`/`kani-driver` by NAME first: `pkill -9 cbmc`,
    NOT `-f` which self-matches the kill command). cap-core's 4 proofs already pass; to re-confirm
    run ONLY `cargo kani -p cap-core --features kani`. At handoff the last FEATURE commit is
-   Phase 3 INC7 (zero-kernel DeviceQueue I/O) `d11de19` (HEAD is the RESUME-update commit after it;
+   Phase 3 INC7b (Extent MAP) `02dc95e` (HEAD is the RESUME-update commit after it;
    run `git log --oneline -20`).
 
 ## Status (Phase 3: zero-kernel I/O + object store — UNDERWAY) 🚧
@@ -157,11 +169,22 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
   address space ⇒ a mapped writable ring is write-anywhere DMA + reachable by every ring-3 task;
   trusted-domain-only via capability distribution, not the MMU. `reap_domain` revokes the cap but does
   NOT unmap the DQ_MAP pages (accepted v0 leak). cap-core byte-unchanged.
-- 🚧 **NEXT = INC7b: Extent MAP + reap teardown** — map an extent's on-disk data into a domain (DMA the
-  sectors into frame(s) → RO-map via `map_user_phys`; `extent_metadata` is the seed) + a per-domain
-  mapping ledger + `unmap`-on-reap + queue-0 reset (close the DQ_MAP leak). Later: `DQ_SUBMIT`
-  kernel-validated descriptors; IRQ completion; VT-d scaffold. **Or Phase 4** (real HPE ProLiant
-  network-boot; SMP/ACPI retrofit) — both Phase-3 theses (T1+T2) now hold. `docs/PHASE3.md` INC7b.
+- ✅ **INC7b — Extent MAP (persisted bytes into a domain; second live `Rights::MAP`)** (commit
+  `02dc95e`; `objstore.rs`, `capspace.rs`, `main.rs`). `objstore::load_extent(lba,len)` DMAs a
+  committed extent's sectors into a fresh RAM frame (pre-`sti`; v0 single-frame ≤4096B; frees the frame
+  on a block error). `capspace`: `ExtentMeta.data_frame_phys`, `mint_extent_mapped`, `X_MAP=4` +
+  `(Extent,X_MAP)=>Rights::MAP` + `extent_map` (maps the frame RO+NX at `EXTENT_MAP_BASE=0x110_0000`,
+  returns the VA). **Verified (fresh + persisted disk):** `extent: X_MAP=>Ok va=0x1100000; mapped-bytes
+  hash == committed 0x7b4ded… match=true; MAP-masked X_MAP=>ErrRights` — the persisted bytes mapped RO
+  into a domain re-hash to the committed content hash, fulfilling the Extent "bytes via MAP" promise.
+  Adversarial review (3 finders → 3-skeptic refute; 4 findings, 0 confirmed). Warnings 8→6
+  (deallocate_frame now live). cap-core byte-unchanged.
+- 🚧 **NEXT (optional Phase-3 hardening) = reap teardown + escalation rungs** — `reap_domain` revokes a
+  dead driver's caps but does NOT unmap its `DQ_MAP`/`X_MAP` pages (accepted v0 leak); add a per-domain
+  mapping ledger + `unmap`-on-reap + queue-0 reset (SUBTLE: DeviceQueue frames device-owned ⇒
+  unmap-only; Extent scratch frames mapping-owned ⇒ unmap + `deallocate_frame`). Later: `DQ_SUBMIT`
+  kernel-validated descriptors; IRQ completion; VT-d scaffold. **Or pivot to Phase 4** (real HPE
+  ProLiant network-boot; SMP/ACPI retrofit) — Phase 3's core is complete (T1+T2 hold). `docs/PHASE3.md`.
 
 ## Status (Phase 2: crash-only domain supervision + restart) ✅
 - ✅ **Restart / self-healing** (commit `a1b37bf`; `supervisor.rs`): `terminate_current` calls
@@ -408,8 +431,9 @@ crash-only restart / self-healing (supervisor re-admits under a budget) ✅ (Pha
 **Phase 3 — zero-kernel I/O + object store: PCI enum ✅ (INC1) → polled virtio-blk driver ✅
 (INC2) → write round-trip ✅ (INC3) → Cairnlog superblock+hash+flush ✅ (INC4) → append-log
 put + content-addressed Extent caps ✅ (INC5) → objects-survive-reboot ✅ (INC6, T2) → DeviceQueue
-zero-kernel I/O ✅ (INC7, T1, first live Rights::MAP) → Extent MAP + reap teardown (INC7b, NEXT);
-see docs/PHASE3.md** → (both Phase-3 theses T1+T2 now hold)
+zero-kernel I/O ✅ (INC7, T1, first live Rights::MAP) → Extent MAP ✅ (INC7b, second live MAP) →
+reap teardown / escalation rungs OR Phase 4 (NEXT); see docs/PHASE3.md** → (Phase-3 core complete:
+T1+T2 hold; Extent + DeviceQueue capability models complete)
 Ring-3 follow-ups (deferred, see commits): fair co-scheduling (the demo now co-schedules
 faulter+client+server across domains and works, but equal EDF deadlines are still broken by
 lowest-index — no round-robin among equal deadlines), return a Memory CPtr (not a raw frame) to

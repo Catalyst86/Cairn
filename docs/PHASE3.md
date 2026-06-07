@@ -142,11 +142,26 @@ CPtrs are ephemeral — sealed sparse 128-bit persisted tokens are CAP_ABI §7, 
   panel** (minimal-T1-first won 44.7/50; key fix: no multi-register ring-3 return ⇒ params baked
   kernel-side, the blob's only syscall is the report) **+ adversarial review** (5 finders → 3-skeptic
   refute; 9 findings, 0 confirmed). Extent MAP deferred to **INC7b**.
-- **INC7b — Extent MAP (the X_WRITE/X_COMMIT bulk-data path) + reap teardown** (NEXT): map an
-  extent's on-disk data into a domain (DMA the sectors into frame(s), then RO-map via `map_user_phys`
-  — `extent_metadata` is the seed); add a per-domain DQ_MAP/Extent mapping ledger + `unmap`-on-reap +
-  queue-0 reset so a reaped driver doesn't leak a live DMA mapping. Optional later: `DQ_SUBMIT`
-  kernel-validated descriptors; IRQ completion (IrqHandler + Notification); VT-d scaffold.
+- **INC7b — Extent MAP ✅ DONE** (commit `02dc95e`; `objstore.rs`, `capspace.rs`, `main.rs`). Fulfils
+  the Extent object's "bytes reach a domain via MAP, never a register" promise (CAP_ABI §5; X_READ
+  returned only the hash). `objstore::load_extent(lba,len)` DMAs an extent's sectors into a fresh RAM
+  frame (pre-`sti`; extent data lives on disk; v0 single-frame `len≤4096`; frees the frame on a block
+  error). `capspace`: `ExtentMeta.data_frame_phys`, `mint_extent_mapped`, `X_MAP=4` +
+  `(Extent,X_MAP)=>Rights::MAP` (second live `Rights::MAP`) + `extent_map` (maps the loaded frame
+  RO+NX at `EXTENT_MAP_BASE=0x110_0000`, returns the VA). **Proof (fresh + persisted disk):** `extent:
+  X_MAP=>Ok va=0x1100000; mapped-bytes hash == committed 0x7b4ded… match=true; MAP-masked
+  X_MAP=>ErrRights` — the mapped bytes re-hash to the committed content hash. **Adversarial review**
+  (3 finders → 3-skeptic refute; 4 findings, 0 confirmed — single-window X_MAP, the documented
+  global-mapping invariant, etc., all accepted v0 limitations). cap-core byte-unchanged. Both Phase-3
+  theses (T1+T2) now hold and the Extent + DeviceQueue capability models are complete.
+- **NEXT (Phase-3 hardening, optional) — reap teardown + escalation rungs:** `reap_domain` revokes a
+  dead driver's caps but does NOT unmap its `DQ_MAP`/`X_MAP` pages (accepted v0 leak) — add a
+  per-domain mapping ledger + `unmap`-on-reap + queue-0 reset so a reaped driver can't leave a live
+  write-anywhere-DMA mapping (SUBTLE: frame-ownership asymmetry — DeviceQueue frames are device-owned
+  so unmap-only; Extent scratch frames are mapping-owned so unmap + `deallocate_frame`). Later:
+  `DQ_SUBMIT` kernel-validated descriptors; IRQ completion (`IrqHandler` + `Notification`); VT-d
+  scaffold (the real DMA-containment fix). **Or pivot to Phase 4** (real-hardware network-boot +
+  SMP/ACPI retrofit) — Phase 3's core is complete.
 
 ## QEMU / disk setup (in `C:\WSL\cairn-go-kernel.sh`, NOT the repo)
 A persistent **16 MiB raw disk** `/root/cairn-disk.img` (created once via `truncate` — `qemu-img`

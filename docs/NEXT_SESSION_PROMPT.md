@@ -30,7 +30,9 @@ panic/fault anywhere):
   LBA32760 512B match=true (flush negotiated=true)`; `objstore: mounted superblock seq=N …` (or
   `objstore: formatted -> seq=1` on a fresh disk); the INC5 extent proof `extent: put lba=L len=59
   hash=0x7b4ded… ; X_READ=>Ok reply_hash=0x7b4ded… ; … content-addressed match=true` then `extent:
-  READ-masked cap X_READ=>ErrRights … X_WRITE=>ErrMethod`; and the INC6 recovery proof `objstore:
+  READ-masked cap X_READ=>ErrRights … X_WRITE=>ErrMethod`; the INC7b Extent-MAP proof `extent:
+  X_MAP=>Ok va=0x1100000; mapped-bytes hash == committed 0x7b4ded… match=true; MAP-masked
+  X_MAP=>ErrRights`; and the INC6 recovery proof `objstore:
   recovered root Extent cptr=0 lba=L … objects-survive-reboot=true` (or `no committed root to recover
   (fresh store)` on the first boot after `rm`); and the INC7 zero-kernel I/O proof `devqueue: DQ_MAP
   (first live Rights::MAP) => Ok base=0x1000000; MAP-masked copy DQ_MAP => Some(ErrRights)` then
@@ -51,21 +53,16 @@ panic/fault anywhere):
   ✅, INC4 Cairnlog superblock+hash+flush ✅, INC5 append-log `put` + content-addressed Extent caps ✅
   (panel fixed a mount() reformat-on-read-error data-loss bug + a smoke/log LBA collision), INC6
   objects-survive-reboot ✅ (T2), INC7 zero-kernel DeviceQueue I/O ✅ (T1, first live `Rights::MAP`:
-  a ring-3 driver does a full virtio-blk READ with ZERO syscalls over a granted DeviceQueue cap;
-  designed via a 4-way design panel + adversarial review, 9 findings/0 confirmed). **BOTH Phase-3
-  theses now hold — T1 (kernel out of the I/O path) + T2 (objects survive reboot).** Last feature
-  commit: `d11de19`.
+  a ring-3 driver does a full virtio-blk READ with ZERO syscalls over a granted DeviceQueue cap),
+  INC7b Extent MAP ✅ (second live `Rights::MAP`: a committed extent's persisted bytes mapped RO into
+  a domain, re-hash == committed hash). Each subtle increment went through a design and/or adversarial
+  panel. **BOTH Phase-3 theses now hold — T1 (kernel out of the I/O path) + T2 (objects survive
+  reboot) — and the Extent + DeviceQueue capability models are complete.** Last feature commit: `02dc95e`.
 
-## STEP 3 — Your task: Phase 3 INC7b — Extent MAP + reap teardown (OR pivot to Phase 4)
-Phase 3's core is essentially complete (T1+T2 both proven). INC7b is the cleanup/rounding-out work;
-pick it OR begin Phase 4 (real-hardware network-boot) — confirm direction with the user first if
-unsure. cap-core stays byte-unchanged (`Extent=8`, `Rights::MAP`, `unmap_page` all already exist).
-- **Extent MAP** (the X_WRITE/X_COMMIT bulk-data path, deferred from INC7): map an extent's on-disk
-  data into a domain. Extent bytes live on DISK (not RAM), so DMA the `{lba,len}` sectors (from
-  `capspace::extent_metadata`, the seed) into freshly-allocated frame(s) via `virtio_blk::read_sector`,
-  then RO-map those frames at a fixed USER VA with the existing `paging::map_user_phys` (writable=false,
-  no_cache=false). Add an `X_MAP=4` method id + `(Extent, X_MAP)=>Rights::MAP` extra-rights arm. Proof:
-  a ring-3 task reads the mapped bytes and reports a hash matching the committed `root_hash`.
+## STEP 3 — Your task: optional Phase-3 hardening (reap teardown) OR pivot to Phase 4
+Phase 3's CORE IS COMPLETE (T1+T2 proven; Extent + DeviceQueue models done). What remains is optional
+hardening + the next phase — **confirm direction with the user** (they may prefer Phase 4, or a
+different priority). cap-core stays byte-unchanged (`unmap_page` already exists). Candidate work:
 - **Reap teardown** (close the accepted v0 leak): `reap_domain` revokes a dead driver's cap but does
   NOT unmap its `DQ_MAP`/Extent pages — a leaked write-anywhere-DMA mapping. Add a per-domain mapping
   ledger (which USER VAs were mapped) + walk it on reap calling `paging::unmap_page`, AND reset queue 0
@@ -138,6 +135,6 @@ management plane + TCB verification. Thesis: *everything is a capability over on
 substrate, and the kernel gets out of the data path.* Phase 3 makes that real (Extent caps over a
 log-structured store; DeviceQueue caps for kernel-free I/O at INC7).
 
-Start by reading `RESUME.md`, confirming the clean boot, then implementing INC7b (or, if you prefer,
-pivot to Phase 4 — both Phase-3 theses already hold). Ask me nothing you can answer from the repo —
-but do confirm direction before any large multi-agent workflow run.
+Start by reading `RESUME.md`, confirming the clean boot, then (Phase-3 core is complete) confirm with
+the user whether to do the optional reap-teardown hardening or pivot to Phase 4. Ask me nothing you
+can answer from the repo — but do confirm direction before any large multi-agent workflow run.
