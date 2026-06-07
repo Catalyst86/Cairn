@@ -21,7 +21,12 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    re-read=Some(…); content-addressed match=true` then `extent: READ-masked cap X_READ=>ErrRights …
    X_WRITE=>ErrMethod`; and the **INC6 recovery proof** `objstore: recovered root Extent cptr=0 lba=L
    len=59 hash=0x7b4ded… (on-disk re-hash matched); X_READ=>Ok …; objects-survive-reboot=true` (or
-   `no committed root to recover (fresh store)` on the very first boot after `rm`). The store PERSISTS:
+   `no committed root to recover (fresh store)` on the very first boot after `rm`); and the **INC7
+   zero-kernel I/O proof** `devqueue: DQ_MAP (first live Rights::MAP) => Ok base=0x1000000; MAP-masked
+   copy DQ_MAP => Some(ErrRights)` then `devqueue: ring3 driver completed virtio READ of LBA 32700 with
+   ZERO syscalls; reported magic=0xca1707d0dead0007 kernel-seeded=0xca1707d0dead0007 match=true`,
+   followed by `domain 5 (task 4) terminated: #UD …` (the driver's clean v0 exit after its one-shot
+   I/O). The store PERSISTS:
    each boot `seq` grows (1→2→3…), `log_head` advances, the same bytes re-`put` to a fresh `lba` with
    the SAME hash (CoW append), and `recover()` re-mints the PRIOR boot's committed root from disk. (`rm
    /root/cairn-disk.img` to reset the store.) Note the old INC2 "read LBA0 magic" line is GONE —
@@ -30,7 +35,9 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
 2. **Phase 3 is UNDERWAY** (zero-kernel I/O + object store; architected in `docs/PHASE3.md`).
    **INC1 (PCI enum) ✅ · INC2 (virtio-blk read) ✅ · INC3 (write) ✅ · INC4 (Cairnlog superblock +
    content hash + flush) ✅ · INC5 (append-log `put` + content-addressed Extent caps) ✅ · INC6
-   (objects survive reboot — T2 milestone) ✅.** The L2 block layer
+   (objects survive reboot — T2 milestone) ✅ · INC7 (zero-kernel DeviceQueue I/O — T1 milestone, first
+   live Rights::MAP) ✅.** BOTH Phase-3 theses now hold: T1 (kernel out of the I/O hot path) and T2
+   (objects survive reboot). The L2 block layer
    (`virtio_blk::read_sector`/`write_sector`/`flush`, one shared `submit()`), the L3 superblock
    (`objstore.rs`: FNV-1a hash, A/B superblock at LBA0/1, format/mount, durable via flush), the **L4
    append-log + Extent caps**, and **reboot recovery** all work; the store PERSISTS across QEMU restarts
@@ -53,14 +60,26 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    the same hash. Verified 2-run: run1 fresh ⇒ "no committed root"; run2 recovers run1's object
    `objects-survive-reboot=true` WITHOUT a new put. (CPtrs are ephemeral, re-derived each boot from the
    durable content hash; sealed persisted tokens are CAP_ABI §7, deferred.)
-   **NEXT = INC7: zero-kernel DeviceQueue grant + Extent MAP (T1 milestone, the namesake).** First
-   live use of `Rights::MAP`: a `DeviceQueue` cap (`ObjectKind::DeviceQueue=9`) whose `DQ_MAP` maps the
-   virtqueue rings + a USER no-cache doorbell page into a TRUSTED driver domain (bump `MAX_DOMAINS`
-   5→6), so a ring-3 driver blob fills a descriptor + rings the doorbell + polls used with ZERO
-   syscalls; plus Extent `MAP` (map the named data sectors into a domain — `extent_metadata` is the
-   seed). Mirror the side-table pattern (`DEVQUEUES`), add `map_user_mmio_page` + a map-existing-phys
-   helper, negative test MAP-masked ⇒ ErrRights. Full plan + the no-IOMMU DMA trust boundary in
-   `docs/PHASE3.md` INC7. cap-core byte-unchanged (Extent=8/DeviceQueue=9 already exist).
+   **INC7 (done, commit `d11de19`):** a trusted ring-3 driver (domain 5) does a full virtio-blk READ
+   with ZERO syscalls over a granted DeviceQueue cap. `paging::map_user_phys` maps an EXISTING phys
+   frame at a USER VA (USER leaf+parents, no alloc/zero, optional NO_CACHE). `virtio_blk` persists the
+   ring/doorbell raw guest-phys + `device_queue_desc()`. `capspace`: `DqMeta`/`DEVQUEUES`,
+   `create_device_queue`, `DQ_INFO=1`/`DQ_MAP=2` (first live `Rights::MAP`, gated via the verified
+   invoke)/`DQ_REPORT=3` (v0 proof channel; `DQ_SUBMIT` kernel-validated submit deferred to v1);
+   `MAX_DOMAINS` 5→6. `user::driver_main` = a 281-byte PIC blob (dual addressing: descriptor `addr` =
+   raw guest-phys baked into params; derefs via `rbp=DQ_BASE`), bounded poll, one `DQ_REPORT`, `ud2`
+   exit. Designed via a judged 4-way design panel (minimal-T1-first, 44.7/50) + adversarial review
+   (9 findings, 0 confirmed). Trust boundary (HONEST v0): no IOMMU + one shared address space ⇒ a
+   mapped writable ring is write-anywhere DMA + reachable by every ring-3 task; trusted-domain-only
+   is enforced by capability distribution, not the MMU. `reap_domain` revokes the cap but does NOT
+   unmap the DQ_MAP pages (accepted v0 leak).
+   **NEXT = INC7b: Extent MAP + reap teardown.** Map an extent's on-disk data into a domain (DMA the
+   sectors into frame(s), then RO-map via `map_user_phys` — `extent_metadata` is the seed); add a
+   per-domain DQ_MAP/Extent mapping ledger + `unmap`-on-reap + queue-0 reset so a reaped driver
+   doesn't leak a live DMA mapping. Later: `DQ_SUBMIT` kernel-validated descriptors; IRQ completion
+   (IrqHandler + Notification); VT-d scaffold. Full plan in `docs/PHASE3.md` INC7b. cap-core
+   byte-unchanged. **Or Phase 4** (network-boot onto the real HPE ProLiant; SMP/ACPI retrofit) — both
+   Phase-3 theses (T1+T2) now hold, so Phase 3's core is essentially complete.
    - **Or small Phase-2 polish** (`docs/CRASH_ONLY.md`/`PORTAL_IPC.md` "deferred"):
      survivor-liveness scrub, per-domain frame reclamation on death, blocking `N_WAIT`.
 3. **cap-core stays byte-unchanged** (the regression gate; `git diff HEAD -- crates/` must be
@@ -68,7 +87,7 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
    `cbmc` running — kill any `cbmc`/`cargo-kani`/`kani-driver` by NAME first: `pkill -9 cbmc`,
    NOT `-f` which self-matches the kill command). cap-core's 4 proofs already pass; to re-confirm
    run ONLY `cargo kani -p cap-core --features kani`. At handoff the last FEATURE commit is
-   Phase 3 INC6 (objects survive reboot) `8e66c0f` (HEAD is the RESUME-update commit after it;
+   Phase 3 INC7 (zero-kernel DeviceQueue I/O) `d11de19` (HEAD is the RESUME-update commit after it;
    run `git log --oneline -20`).
 
 ## Status (Phase 3: zero-kernel I/O + object store — UNDERWAY) 🚧
@@ -119,13 +138,30 @@ built as a **Claude Code × Grok Build** collaboration. Repo: `C:\Users\danie\De
   objects-survive-reboot=true` — run1's committed object re-minted as a live cap from disk alone, no
   new put. CPtrs are ephemeral (re-derived each boot from the durable hash); sealed persisted tokens
   are CAP_ABI §7, deferred. cap-core byte-unchanged; no new warnings.
-- 🚧 **NEXT = INC7 zero-kernel DeviceQueue grant + Extent MAP (T1 milestone, the namesake)** — first
-  live `Rights::MAP`: a `DeviceQueue` cap (`ObjectKind::DeviceQueue=9`) whose `DQ_MAP` maps the
-  virtqueue rings + a USER no-cache doorbell into a TRUSTED driver domain (bump `MAX_DOMAINS` 5→6) so a
-  ring-3 driver does I/O with ZERO syscalls; plus Extent `MAP` (map the named sectors —
-  `extent_metadata` is the seed). Mirror the side-table pattern (`DEVQUEUES`), add `map_user_mmio_page`
-  + a map-existing-phys helper, negative test MAP-masked ⇒ ErrRights. Architecture, cap-mapping
-  (Extent=8/DeviceQueue=9, cap-core unchanged), the no-IOMMU DMA trust boundary: `docs/PHASE3.md`.
+- ✅ **INC7 — zero-kernel DeviceQueue I/O (T1 milestone, the namesake; first live `Rights::MAP`)**
+  (commit `d11de19`; `paging.rs`, `virtio_blk.rs`, `capspace.rs`, `user.rs`, `main.rs`). A trusted
+  ring-3 driver (domain 5) does a full virtio-blk READ — descriptor chain, doorbell, used poll — with
+  ZERO syscalls over a granted DeviceQueue cap. `paging::map_user_phys` (map an EXISTING phys frame at
+  a USER VA, no alloc/zero, optional NO_CACHE, USER leaf+parents); `virtio_blk` persists ring/doorbell
+  raw guest-phys + `device_queue_desc()`; `capspace` `DqMeta`/`DEVQUEUES` + `create_device_queue` +
+  `DQ_INFO`/`DQ_MAP`/`DQ_REPORT` (DQ_MAP = first live `Rights::MAP`, via the verified invoke; maps
+  desc/avail/buf RW, used RO, doorbell RW+NO_CACHE at `DQ_BASE=0x100_0000`); `MAX_DOMAINS` 5→6.
+  `user::driver_main` = a 281-byte PIC blob (dual addressing; bounded poll; one `DQ_REPORT`; `ud2`
+  exit). **Verified (fresh + persisted disk):** `DQ_MAP => Ok base=0x1000000; MAP-masked copy =>
+  ErrRights`; `ring3 driver completed virtio READ of LBA 32700 with ZERO syscalls … match=true` (the
+  kernel seeds a magic + clears the shared buffer to a sentinel, so match=true requires a REAL device
+  read — the magic is never exposed to the driver). All prior proofs intact; recv_cptr=3; 8 warnings
+  (no new). **Designed via a judged 4-way design panel** (minimal-T1-first, 44.7/50; resolved the
+  no-multi-register-return ABI fix: params baked kernel-side) **+ adversarial review** (5 finders →
+  3-skeptic refute; 9 findings, 0 confirmed). **Trust boundary (HONEST v0):** no IOMMU + one shared
+  address space ⇒ a mapped writable ring is write-anywhere DMA + reachable by every ring-3 task;
+  trusted-domain-only via capability distribution, not the MMU. `reap_domain` revokes the cap but does
+  NOT unmap the DQ_MAP pages (accepted v0 leak). cap-core byte-unchanged.
+- 🚧 **NEXT = INC7b: Extent MAP + reap teardown** — map an extent's on-disk data into a domain (DMA the
+  sectors into frame(s) → RO-map via `map_user_phys`; `extent_metadata` is the seed) + a per-domain
+  mapping ledger + `unmap`-on-reap + queue-0 reset (close the DQ_MAP leak). Later: `DQ_SUBMIT`
+  kernel-validated descriptors; IRQ completion; VT-d scaffold. **Or Phase 4** (real HPE ProLiant
+  network-boot; SMP/ACPI retrofit) — both Phase-3 theses (T1+T2) now hold. `docs/PHASE3.md` INC7b.
 
 ## Status (Phase 2: crash-only domain supervision + restart) ✅
 - ✅ **Restart / self-healing** (commit `a1b37bf`; `supervisor.rs`): `terminate_current` calls
@@ -371,8 +407,9 @@ crash-only domain supervision (ring-3 fault terminates the domain, not the kerne
 crash-only restart / self-healing (supervisor re-admits under a budget) ✅ (Phase 2 COMPLETE) →
 **Phase 3 — zero-kernel I/O + object store: PCI enum ✅ (INC1) → polled virtio-blk driver ✅
 (INC2) → write round-trip ✅ (INC3) → Cairnlog superblock+hash+flush ✅ (INC4) → append-log
-put + content-addressed Extent caps ✅ (INC5) → objects-survive-reboot ✅ (INC6) → DeviceQueue
-zero-kernel grant + Extent MAP (INC7, NEXT); see docs/PHASE3.md** →
+put + content-addressed Extent caps ✅ (INC5) → objects-survive-reboot ✅ (INC6, T2) → DeviceQueue
+zero-kernel I/O ✅ (INC7, T1, first live Rights::MAP) → Extent MAP + reap teardown (INC7b, NEXT);
+see docs/PHASE3.md** → (both Phase-3 theses T1+T2 now hold)
 Ring-3 follow-ups (deferred, see commits): fair co-scheduling (the demo now co-schedules
 faulter+client+server across domains and works, but equal EDF deadlines are still broken by
 lowest-index — no round-robin among equal deadlines), return a Memory CPtr (not a raw frame) to

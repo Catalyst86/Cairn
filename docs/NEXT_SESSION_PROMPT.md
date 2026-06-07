@@ -32,9 +32,12 @@ panic/fault anywhere):
   hash=0x7b4ded… ; X_READ=>Ok reply_hash=0x7b4ded… ; … content-addressed match=true` then `extent:
   READ-masked cap X_READ=>ErrRights … X_WRITE=>ErrMethod`; and the INC6 recovery proof `objstore:
   recovered root Extent cptr=0 lba=L … objects-survive-reboot=true` (or `no committed root to recover
-  (fresh store)` on the first boot after `rm`). The store persists — each boot `seq` grows, the same
-  bytes re-`put` to a fresh `lba` with the SAME hash (CoW), and `recover()` re-mints the prior boot's
-  committed root from disk.
+  (fresh store)` on the first boot after `rm`); and the INC7 zero-kernel I/O proof `devqueue: DQ_MAP
+  (first live Rights::MAP) => Ok base=0x1000000; MAP-masked copy DQ_MAP => Some(ErrRights)` then
+  `devqueue: ring3 driver completed virtio READ of LBA 32700 with ZERO syscalls; reported magic=…07
+  kernel-seeded=…07 match=true`, then `domain 5 (task 4) terminated: #UD …` (driver's clean v0 exit).
+  The store persists — each boot `seq` grows, the same bytes re-`put` to a fresh `lba` with the SAME
+  hash (CoW), and `recover()` re-mints the prior boot's committed root from disk.
 - Phase 2 (after the cap self-tests, post-`sti`): the crash-only self-healing loop
   (`domain 4 … terminated: #UD` → `supervisor: RESTARTED …` ×2 → `reaped`), then the endpoint
   rendezvous (`ep: domain2 E_RECV resumed … recv_cptr=3`, MOVE proof `cptr=1 => status=1`), plus
@@ -44,36 +47,37 @@ panic/fault anywhere):
 - **Phases 0, 1, 2 are COMPLETE.** Phase 2 = ring-3 domains, EDF + time-capabilities, portal IPC
   (blocking endpoint rendezvous + capability transfer + scheduler block/wake), and crash-only
   domain supervision **+ restart/self-healing**.
-- **Phase 3 (zero-kernel I/O + object store) is UNDERWAY:** INC1 PCI enum ✅, INC2 virtio-blk read
-  ✅, INC3 write ✅, INC4 Cairnlog superblock + content hash + `flush` ✅, INC5 append-log `put` +
-  content-addressed Extent caps ✅ (adversarial panel caught + fixed a mount() reformat-on-read-error
-  data-loss bug and a smoke-test/log LBA collision), INC6 objects-survive-reboot ✅ (T2 milestone:
-  `objstore::recover()` re-mints the prior boot's committed root as a live Extent cap from disk, hash
-  re-verified — proven 2-run). Last feature commit: `8e66c0f`.
+- **Phase 3 (zero-kernel I/O + object store):** INC1 PCI enum ✅, INC2 virtio-blk read ✅, INC3 write
+  ✅, INC4 Cairnlog superblock+hash+flush ✅, INC5 append-log `put` + content-addressed Extent caps ✅
+  (panel fixed a mount() reformat-on-read-error data-loss bug + a smoke/log LBA collision), INC6
+  objects-survive-reboot ✅ (T2), INC7 zero-kernel DeviceQueue I/O ✅ (T1, first live `Rights::MAP`:
+  a ring-3 driver does a full virtio-blk READ with ZERO syscalls over a granted DeviceQueue cap;
+  designed via a 4-way design panel + adversarial review, 9 findings/0 confirmed). **BOTH Phase-3
+  theses now hold — T1 (kernel out of the I/O path) + T2 (objects survive reboot).** Last feature
+  commit: `d11de19`.
 
-## STEP 3 — Your task: Phase 3 INC7 — zero-kernel DeviceQueue grant + Extent MAP (T1, the namesake)
-INC6 (commit `8e66c0f`) closed T2 (objects survive reboot). INC7 is **T1**: the kernel leaves the I/O
-hot path after a one-time capability grant (DESIGN.md pillar 4) — **the first live use of
-`Rights::MAP`**. This is SUBTLE/DMA-adjacent: do a judged design panel + adversarial review (Workflow
-tool) before committing, and re-read the **no-IOMMU DMA trust boundary** in `docs/PHASE3.md` (a mapped
-DeviceQueue is write-anywhere DMA → grant ONLY to a TRUSTED driver domain in v0). cap-core stays
-byte-unchanged (`DeviceQueue=9`, `Rights::MAP` already exist — only USE them).
-- **Paging helpers** (`kernel/src/paging.rs`): `map_user_mmio_page` (a USER + NO_CACHE doorbell page)
-  and a **map-existing-phys-frame-at-user-VA** helper (the current `map_user_page` allocates a FRESH
-  frame, so it can't map the already-allocated ring frames — you need to map existing phys).
-- **DeviceQueue object** (`kernel/src/capspace.rs`, mirror `EXTENTS`/`ENDPOINTS` EXACTLY — const-static
-  side-table, never touch cap-core): `DQ_INFO=1`/`DQ_MAP=2`/`DQ_SUBMIT=3` ids; `DEVQUEUES:[DqMeta;
-  OBJECT_TABLE_SIZE]`; `create_device_queue`; wire `dispatch_method` `extra`-rights `(DeviceQueue,
-  DQ_MAP)=>MAP`, `(DeviceQueue,DQ_SUBMIT)=>WRITE`, `(DeviceQueue,DQ_INFO)=>READ`. `DQ_MAP` maps the
-  virtqueue rings + the doorbell page contiguously into a trusted driver domain (bump `MAX_DOMAINS`
-  5→6) and returns one base VA.
-- **Extent MAP**: extend the Extent path so `MAP` maps the named data sectors (from
-  `extent_metadata` — the seed) into a domain's address space (bytes reach a domain via MAP, never a
-  register, per CAP_ABI §5).
-- **Proof (boot-log):** a ring-3 driver blob, having received a `DeviceQueue` cap, fills a descriptor +
-  rings the doorbell + polls `used` with **ZERO syscalls** (true zero-kernel I/O); negative test: a
-  MAP-masked copy of the cap ⇒ `ErrRights`. Optional INC8 (may slip to Phase 4): `DQ_SUBMIT`
-  kernel-validated descriptors; IRQ completion (`IrqHandler` + `Notification`); VT-d scaffold.
+## STEP 3 — Your task: Phase 3 INC7b — Extent MAP + reap teardown (OR pivot to Phase 4)
+Phase 3's core is essentially complete (T1+T2 both proven). INC7b is the cleanup/rounding-out work;
+pick it OR begin Phase 4 (real-hardware network-boot) — confirm direction with the user first if
+unsure. cap-core stays byte-unchanged (`Extent=8`, `Rights::MAP`, `unmap_page` all already exist).
+- **Extent MAP** (the X_WRITE/X_COMMIT bulk-data path, deferred from INC7): map an extent's on-disk
+  data into a domain. Extent bytes live on DISK (not RAM), so DMA the `{lba,len}` sectors (from
+  `capspace::extent_metadata`, the seed) into freshly-allocated frame(s) via `virtio_blk::read_sector`,
+  then RO-map those frames at a fixed USER VA with the existing `paging::map_user_phys` (writable=false,
+  no_cache=false). Add an `X_MAP=4` method id + `(Extent, X_MAP)=>Rights::MAP` extra-rights arm. Proof:
+  a ring-3 task reads the mapped bytes and reports a hash matching the committed `root_hash`.
+- **Reap teardown** (close the accepted v0 leak): `reap_domain` revokes a dead driver's cap but does
+  NOT unmap its `DQ_MAP`/Extent pages — a leaked write-anywhere-DMA mapping. Add a per-domain mapping
+  ledger (which USER VAs were mapped) + walk it on reap calling `paging::unmap_page`, AND reset queue 0
+  (re-establish kernel ownership) since a dead driver may have an in-flight descriptor. NOTE the
+  frame-ownership asymmetry: DeviceQueue frames are device-owned (unmap ONLY); Extent scratch frames
+  are mapping-owned (unmap + `deallocate_frame`). This is SUBTLE — design panel + adversarial review.
+- **Later / Phase-4-slippable:** `DQ_SUBMIT` kernel-validated descriptors (the v1 escalation rung);
+  IRQ completion (`IrqHandler` + `Notification` instead of polling); VT-d/intel-iommu scaffold (the
+  real DMA-containment fix). See `docs/PHASE3.md` INC7b + the DMA-trust-boundary escalation ladder.
+- **Phase 4 alternative:** network-boot onto James's HPE ProLiant via the existing iPXE server; the
+  big SMP/ACPI/NUMA retrofit (per-CPU run queues, real locks, CR3-per-address-space). See the
+  `studio-server-access` memory + `docs/DESIGN.md` phases.
 
 Full plan + the no-IOMMU DMA trust boundary + the escalation ladder (v0 trust → v1 validated descs →
 v2 VT-d): `docs/PHASE3.md` INC7 + "DMA trust boundary".
@@ -134,5 +138,6 @@ management plane + TCB verification. Thesis: *everything is a capability over on
 substrate, and the kernel gets out of the data path.* Phase 3 makes that real (Extent caps over a
 log-structured store; DeviceQueue caps for kernel-free I/O at INC7).
 
-Start by reading `RESUME.md`, confirming the clean boot, then implementing INC7. Ask me nothing you
-can answer from the repo — but do confirm direction before any large multi-agent workflow run.
+Start by reading `RESUME.md`, confirming the clean boot, then implementing INC7b (or, if you prefer,
+pivot to Phase 4 — both Phase-3 theses already hold). Ask me nothing you can answer from the repo —
+but do confirm direction before any large multi-agent workflow run.

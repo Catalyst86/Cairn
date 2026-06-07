@@ -20,17 +20,22 @@ already has `MAP`/`READ`/`WRITE`/`DELEGATE`/`REVOKE`. **No new cap-core anything
 - **Extent**: `X_READ`→READ (returns metadata `{lba,len,hash}` only — bytes reach a domain
   via Extent **MAP**, never a register; CAP_ABI §5 "core not in the bulk data path"),
   `X_WRITE`→WRITE (mints a NEW Extent — content-addressed CoW), `X_COMMIT`→WRITE.
-- **DeviceQueue**: `DQ_MAP`→MAP (**first live use of `Rights::MAP`**; maps rings + a USER
-  no-cache doorbell page into a trusted driver domain), `DQ_SUBMIT`→WRITE (kernel-mediated
-  fallback), `DQ_INFO`→READ.
+- **DeviceQueue** (INC7 ✅ DONE): `DQ_MAP`→MAP (**first live use of `Rights::MAP`**; maps the
+  rings + buffer + a USER no-cache doorbell page into a trusted driver domain), `DQ_INFO`→READ
+  (echoes qsize), `DQ_REPORT`→WRITE (the **v0 proof channel** — a ring-3 driver reports its
+  zero-syscall I/O result; the kernel validates + logs it). The originally-planned `DQ_SUBMIT`
+  (kernel-mediated/validated descriptor submit) is the **deferred v1 escalation**, not v0.
 - New method-id consts live in `capspace.rs` (NOT cap-core): `X_READ=1,X_WRITE=2,X_COMMIT=3`;
-  `DQ_INFO=1,DQ_MAP=2,DQ_SUBMIT=3`. Dispatch reuses the existing two-step (verified
+  `DQ_INFO=1,DQ_MAP=2,DQ_REPORT=3`. Dispatch reuses the existing two-step (verified
   `CapTable::invoke`+`lookup`, then the method-specific `extra`-right match in `dispatch_method`).
 - **Payload lives kernel-side** (ObjectMeta is frozen) in const-init static-mut side-tables
   mirroring `NOTIFY`/`ENDPOINTS`: `EXTENTS:[ExtentMeta{lba,len,hash};N]`,
-  `DEVQUEUES:[DqMeta{…};N]`, accessed only IRQs-off via `addr_of_mut!` (const-init avoids the
-  boot-stack-overflow memcpy cascade). Constructors mirror `create_endpoint`/`mint_timeslice`.
-  `reap_domain` already revokes a dead driver domain's DeviceQueue cap (clears its table).
+  `DEVQUEUES:[DqMeta{…};N]` (ring/buffer/doorbell raw guest-phys + qsize + proof state), accessed
+  only IRQs-off via `addr_of_mut!` (const-init avoids the boot-stack-overflow memcpy cascade).
+  Constructors mirror `create_endpoint`/`mint_timeslice`. **`reap_domain` revokes a dead driver
+  domain's DeviceQueue cap (clears its table) but does NOT unmap the `DQ_MAP`-ed pages** — an
+  accepted v0 leak (single shared address space, no IOMMU): the mapped ring outlives the domain
+  until a per-domain mapping ledger + queue reset land (INC7b/later).
 
 ## DMA trust boundary (HONEST — this kernel has NO IOMMU)
 A virtqueue descriptor's `addr` is a raw guest-physical address the device DMAs to/from. With
@@ -117,14 +122,31 @@ CPtrs are ephemeral — sealed sparse 128-bit persisted tokens are CAP_ABI §7, 
   recover (fresh store)` and commits hash H; run2 prints `recovered root Extent cptr=0 lba=2 len=59
   hash=H (on-disk re-hash matched); X_READ=>Ok …; objects-survive-reboot=true` — run1's object recovered
   as a live cap from disk alone, no new put. (Persisted sealed cap tokens are CAP_ABI §7, deferred.)
-- **INC7 — DeviceQueue cap + zero-kernel data path (T1 milestone, the namesake):**
-  `map_user_mmio_page` (USER+NO_CACHE doorbell) + a map-existing-phys-frame-at-user-VA helper
-  (`map_user_page` allocates a fresh frame, can't map the ring frames); `create_device_queue` +
-  DEVQUEUES; `DQ_MAP` maps rings+doorbell contiguously into a trusted driver domain (bump
-  `MAX_DOMAINS` 5→6), returns one base VA; a ring-3 driver blob fills a descriptor + rings the
-  doorbell + polls used with ZERO syscalls; negative test: MAP-masked copy → ErrRights. Optional
-  INC8 (may slip to Phase 4): `DQ_SUBMIT` validated descriptors; IRQ completion (IrqHandler +
-  Notification); VT-d scaffold.
+- **INC7 — DeviceQueue cap + zero-kernel data path (T1 milestone, the namesake) ✅ DONE**
+  (commit `d11de19`; `paging.rs`, `virtio_blk.rs`, `capspace.rs`, `user.rs`, `main.rs`). A trusted
+  ring-3 driver (domain 5) does a full virtio-blk READ — descriptor chain, doorbell, used poll —
+  with ZERO syscalls, over a granted DeviceQueue cap. `paging::map_user_phys` maps an EXISTING phys
+  frame at a USER VA (USER leaf+parents, no alloc/zero, optional NO_CACHE) — the missing primitive
+  (`map_user_page` allocates a fresh frame). `virtio_blk` persists the queue-0 ring/doorbell raw
+  guest-phys + `device_queue_desc()`. `capspace`: `DqMeta`/`DEVQUEUES`, `create_device_queue`,
+  `DQ_INFO=1`/`DQ_MAP=2`/`DQ_REPORT=3`; `DQ_MAP` (first live `Rights::MAP`, gated via the verified
+  invoke) maps desc/avail/buf RW, used RO (device DMAs used, not via the CPU PTE), doorbell
+  RW+NO_CACHE at `DQ_BASE=0x100_0000`. `user::driver_main` is a 281-byte PIC blob (dual addressing:
+  descriptor `addr` fields = raw guest-phys baked into params; derefs via `rbp=DQ_BASE`), bounded
+  poll, one `DQ_REPORT`, exit via `ud2`. `MAX_DOMAINS` 5→6 (driver = domain 5; `MAX_TASKS`=5
+  unchanged — driver is the 5th task). **Proof (fresh + persisted disk):** `DQ_MAP (first live
+  Rights::MAP) => Ok base=0x1000000; MAP-masked copy => ErrRights`; `ring3 driver completed virtio
+  READ of LBA 32700 with ZERO syscalls; reported magic=…07 kernel-seeded=…07 match=true` (the
+  kernel seeds a magic + clears the shared buffer to a sentinel, so `match=true` requires a real
+  device read — the magic is never exposed to the driver). **Designed via a judged 4-way design
+  panel** (minimal-T1-first won 44.7/50; key fix: no multi-register ring-3 return ⇒ params baked
+  kernel-side, the blob's only syscall is the report) **+ adversarial review** (5 finders → 3-skeptic
+  refute; 9 findings, 0 confirmed). Extent MAP deferred to **INC7b**.
+- **INC7b — Extent MAP (the X_WRITE/X_COMMIT bulk-data path) + reap teardown** (NEXT): map an
+  extent's on-disk data into a domain (DMA the sectors into frame(s), then RO-map via `map_user_phys`
+  — `extent_metadata` is the seed); add a per-domain DQ_MAP/Extent mapping ledger + `unmap`-on-reap +
+  queue-0 reset so a reaped driver doesn't leak a live DMA mapping. Optional later: `DQ_SUBMIT`
+  kernel-validated descriptors; IRQ completion (IrqHandler + Notification); VT-d scaffold.
 
 ## QEMU / disk setup (in `C:\WSL\cairn-go-kernel.sh`, NOT the repo)
 A persistent **16 MiB raw disk** `/root/cairn-disk.img` (created once via `truncate` — `qemu-img`
