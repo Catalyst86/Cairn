@@ -496,6 +496,6 @@ Keep adding Kani proofs per component (cap-core's 4 + frame-alloc's 4 now both p
 keystone's own page tables is now optional hardening, no longer blocking.
 
 ## Server (not needed until Phase 4)
-HPE ProLiant, currently OFF. iLO `192.168.99.2` (web, user Administrator, reachable only with
-laptop Ethernet in the POE switch). OS over Wi-Fi: `ssh james@studio.local` (key-only,
-`~/.ssh/id_ed25519`). Details in the `studio-server-access` memory.
+Target hardware is an HPE ProLiant (x86-64, iLO-managed), currently OFF. Connection details — iLO
+address, SSH host/user, and keys — are kept OUT of this public repo; see the private
+`studio-server-access` memory (local to the dev machine, not committed).
