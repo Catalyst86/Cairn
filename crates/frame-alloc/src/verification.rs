@@ -8,7 +8,10 @@
 //! - Returned indices are always in-bounds.
 //!
 //! Run with: `cargo kani -p frame-alloc --features kani` (Kani must be installed).
-//! We use a small FRAMES=128 so the state space is explorable.
+//! We use a small FRAMES=8 (one bitmap word) + `#[kani::unwind(10)]` so CBMC fully unrolls the
+//! data-dependent loops (the `alloc_bounds_only` exhaust loop runs ≤ N times) and terminates.
+//! The properties are universal over the const-generic allocator, so N=8 is representative;
+//! FRAMES=128 left the exhaust loop unbounded for CBMC and never converged (it "hung").
 
 #![cfg(feature = "kani")]
 
@@ -16,9 +19,10 @@ use crate::BitmapFrameAllocator;
 
 /// After alloc returns Some(f), that frame is marked used and f is in bounds.
 /// Also: alloc never returns a frame that was not free.
+#[kani::unwind(10)]
 #[kani::proof]
 fn no_double_allocation() {
-    const N: usize = 128;
+    const N: usize = 8;
     let mut alloc: BitmapFrameAllocator<N> = BitmapFrameAllocator::new();
 
     // Nondet choose a frame to make free.
@@ -42,9 +46,10 @@ fn no_double_allocation() {
 }
 
 /// Two allocs with no free between them must produce distinct frames (when >=2 free).
+#[kani::unwind(10)]
 #[kani::proof]
 fn distinct_allocs_no_intervening_free() {
-    const N: usize = 128;
+    const N: usize = 8;
     let mut alloc: BitmapFrameAllocator<N> = BitmapFrameAllocator::new();
 
     let f1: usize = kani::any();
@@ -60,9 +65,10 @@ fn distinct_allocs_no_intervening_free() {
 }
 
 /// mark_free(f) makes is_free(f) true; alloc can return it; free makes it free again.
+#[kani::unwind(10)]
 #[kani::proof]
 fn free_roundtrip_and_is_free() {
-    const N: usize = 128;
+    const N: usize = 8;
     let mut alloc: BitmapFrameAllocator<N> = BitmapFrameAllocator::new();
 
     let f: usize = kani::any();
@@ -81,9 +87,10 @@ fn free_roundtrip_and_is_free() {
 }
 
 /// alloc() only ever returns values < FRAMES (even under nondet frees and out-of-range marks).
+#[kani::unwind(10)]
 #[kani::proof]
 fn alloc_bounds_only() {
-    const N: usize = 128;
+    const N: usize = 8;
     let mut alloc: BitmapFrameAllocator<N> = BitmapFrameAllocator::new();
 
     // Free a few arbitrary frames (some may be duplicates or out of range).
