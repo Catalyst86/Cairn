@@ -212,6 +212,53 @@ const DQ_EMPTY: DqMeta = DqMeta {
 /// SAFETY contract: single-CPU, accessed only with interrupts off (see module docs).
 static mut DEVQUEUES: [DqMeta; OBJECT_TABLE_SIZE] = [DQ_EMPTY; OBJECT_TABLE_SIZE];
 
+/// Per-domain MAPPING LEDGER (INC7c reap teardown). Each `DQ_MAP`/`X_MAP` records the USER VA it
+/// installed under the INVOKING domain, so [`reap_domain`] can UNMAP those pages when the domain
+/// dies — closing the v0 leak where a reaped driver's virtqueue ring stayed mapped (a lingering
+/// write-anywhere-DMA window in the single shared address space).
+///
+/// UNMAP-ONLY (no frame freeing): reaping a domain revokes its *access* (just as clearing its
+/// CapTable revokes its cap access) — it must NOT free the backing frames, because those belong
+/// to the SHARED, PERSISTENT objects, not the mapping: the DeviceQueue ring/buffer/doorbell frames
+/// are the live virtio driver's (device-owned), and an Extent's data frame is pinned by
+/// `EXTENTS[oid].data_frame_phys` for the object's lifetime (other holders can still `X_MAP` it).
+/// Freeing either on a mapping-domain's death would be a use-after-free / double-free against the
+/// surviving object. Frame reclamation is therefore the OBJECT-destroy path's job (deferred; no
+/// object-destroy in v0), exactly mirroring how `reap_domain` clears the CapTable but the objects
+/// persist for other cap holders.
+#[derive(Clone, Copy)]
+struct MapEntry {
+    va: u64,
+}
+const MAP_NONE: MapEntry = MapEntry { va: 0 };
+/// Max mappings recorded per domain (5 DeviceQueue pages + a few Extent maps is ample for v0).
+const MAX_MAPS_PER_DOMAIN: usize = 8;
+struct DomainMaps {
+    entries: [MapEntry; MAX_MAPS_PER_DOMAIN],
+    count: usize,
+}
+const DM_EMPTY: DomainMaps = DomainMaps { entries: [MAP_NONE; MAX_MAPS_PER_DOMAIN], count: 0 };
+/// Per-domain mapping ledger. const static-init (no boot-stack temporary).
+/// SAFETY contract: single-CPU, accessed only with interrupts off (see module docs).
+static mut DOMAIN_MAPS: [DomainMaps; MAX_DOMAINS] = [DM_EMPTY; MAX_DOMAINS];
+
+/// Record a USER mapping `va` under `domain`'s ledger, so `reap_domain` unmaps it when the domain
+/// dies. Silently drops the record if the ledger is full (reverts to the documented leak for that
+/// one page, but `MAX_MAPS_PER_DOMAIN` is ample for v0's 5 DeviceQueue pages + a few Extent maps).
+fn record_domain_map(domain: usize, va: u64) {
+    if domain >= MAX_DOMAINS {
+        return;
+    }
+    // SAFETY: single-CPU, IRQs off; sole accessor of DOMAIN_MAPS in this region.
+    unsafe {
+        let dm = &mut (*core::ptr::addr_of_mut!(DOMAIN_MAPS))[domain];
+        if dm.count < MAX_MAPS_PER_DOMAIN {
+            dm.entries[dm.count] = MapEntry { va };
+            dm.count += 1;
+        }
+    }
+}
+
 /// Throttle for endpoint proof prints.
 static EP_REPORTS: AtomicU64 = AtomicU64::new(0);
 
@@ -325,14 +372,16 @@ pub fn cap_invoke_in(domain: usize, cptr: u16, method: u16, arg: u64) -> (Status
         // OBJECTS guard + DOMAINS view drop here, before any allocator / NOTIFY access.
     };
 
-    dispatch_method(kind, oid, rights, method, arg)
+    dispatch_method(domain, kind, oid, rights, method, arg)
 }
 
 /// Post-validation dispatch on (object kind, method) for the non-blocking object kinds
-/// (Memory, Notification). Endpoints are handled in [`cap_invoke_ipc`] instead because
-/// they may block and/or transfer a capability. `rights` is the already-validated cap's
-/// rights; INVOKE was enforced by the caller, here we layer any method-specific right.
-fn dispatch_method(kind: ObjectKind, oid: u64, rights: Rights, method: u16, arg: u64) -> (Status, u64) {
+/// (Memory, Notification, Extent, DeviceQueue). Endpoints are handled in [`cap_invoke_ipc`]
+/// instead because they may block and/or transfer a capability. `rights` is the already-validated
+/// cap's rights; INVOKE was enforced by the caller, here we layer any method-specific right.
+/// `domain` is the invoking domain (for the MAP arms to record their mappings in the per-domain
+/// teardown ledger).
+fn dispatch_method(domain: usize, kind: ObjectKind, oid: u64, rights: Rights, method: u16, arg: u64) -> (Status, u64) {
     let extra = match (kind, method) {
         (ObjectKind::Notification, N_SIGNAL) => Rights::WRITE,
         (ObjectKind::Notification, N_POLL) => Rights::READ,
@@ -388,12 +437,12 @@ fn dispatch_method(kind: ObjectKind, oid: u64, rights: Rights, method: u16, arg:
             (Status::Ok, h)
         }
         // Extent X_MAP (INC7b): map the extent's persisted bytes RO into the domain (MAP gated above).
-        (ObjectKind::Extent, X_MAP) => extent_map(oid),
+        (ObjectKind::Extent, X_MAP) => extent_map(domain, oid),
         // DeviceQueue (INC7 zero-kernel I/O): INFO echoes qsize; MAP maps the rings+doorbell
         // into the trusted driver domain (first live Rights::MAP); REPORT validates the driver's
         // zero-syscall I/O result. Rights enforced by the `extra` gate above.
         (ObjectKind::DeviceQueue, DQ_INFO) => (Status::Ok, devqueue_qsize(oid)),
-        (ObjectKind::DeviceQueue, DQ_MAP) => devqueue_map(oid),
+        (ObjectKind::DeviceQueue, DQ_MAP) => devqueue_map(domain, oid),
         (ObjectKind::DeviceQueue, DQ_REPORT) => devqueue_report(oid, arg),
         // Extent X_WRITE/X_COMMIT: WRITE was enforced above, but the content-addressed write
         // path needs the bytes, which arrive via Extent MAP in INC7. So a rights-valid write
@@ -439,7 +488,7 @@ pub fn cap_invoke_ipc(cptr: u16, method: u16, arg0: u64, xfer: u16) -> (u64, u64
             if xfer != CPTR_NONE {
                 return (Status::ErrMethod as u64, 0, CPTR_NONE);
             }
-            let (st, reply) = dispatch_method(kind, oid, rights, method, arg0);
+            let (st, reply) = dispatch_method(domain, kind, oid, rights, method, arg0);
             (st as u64, reply, CPTR_NONE)
         }
     }
@@ -671,19 +720,27 @@ fn do_cap_transfer(src_dom: usize, src_cptr: u16, dst_dom: usize) -> Result<u16,
 /// Reap a terminated domain (crash-only supervision): **revoke its authority** by
 /// clearing its CapTable — every CPtr it held vanishes (the underlying objects persist
 /// for whoever else holds caps to them, so this revokes only the dead domain, not the
-/// shared object) — and **scrub every endpoint** where the dead task was the parked
-/// peer, so a surviving partner never rendezvous-wakes a dead task. Called from
-/// `sched::terminate_current` with interrupts off on a single CPU.
+/// shared object) — **scrub every endpoint** where the dead task was the parked peer, so a
+/// surviving partner never rendezvous-wakes a dead task — and (INC7c) **tear down the dead
+/// domain's `DQ_MAP`/`X_MAP` mappings**: UNMAP every recorded USER page, closing the lingering
+/// write-anywhere-DMA window that a granted, now-orphaned virtqueue ring would otherwise leave
+/// in the single shared address space. Reap is UNMAP-ONLY: the backing frames are object-owned
+/// (the live virtio rings, an extent's pinned data frame), so they are NOT freed here — that is
+/// the object-destroy path's job (deferred), mirroring how the CapTable clear revokes the dead
+/// domain's authority while the shared objects persist. Called from `sched::terminate_current`
+/// with interrupts off on a single CPU.
 ///
-/// NOTE (v0 liveness gap): the scrub is one-directional — it clears slots the DEAD task
-/// was parked on. A SURVIVOR already parked *waiting for* the dead task (its slot's
-/// `peer_task` is the survivor's own index) is NOT woken and would block until a (now
-/// impossible) partner arrives. Closing this needs endpoint peer-tracking / IPC timeouts
-/// / domain restart — deferred to 4c (see docs/CRASH_ONLY.md). The current demo's faulter
-/// is no domain's endpoint partner, so it is not exercised.
+/// NOTE (v0 gaps): (1) the endpoint scrub is one-directional — a SURVIVOR parked *waiting
+/// for* the dead task is NOT woken (needs peer-tracking / IPC timeouts; the demo's faulter
+/// is no endpoint partner, so unexercised). (2) Queue-0 is NOT reset here: a driver that
+/// died MID-I/O could leave an in-flight descriptor, but in v0 nothing reuses queue 0 after
+/// a driver dies (the kernel's own I/O is pre-`sti`, there is no driver restart), so a stale
+/// in-flight request simply completes into a now-unmapped, unread frame — harmless. A real
+/// queue reset is needed only once the queue is reused after a driver death (e.g. driver
+/// restart), deferred with the `DQ_SUBMIT`/IRQ work.
 pub fn reap_domain(domain: u16, task_idx: u16) {
     let d = domain as usize;
-    // SAFETY: single-CPU, IRQs off; raw access to DOMAINS/ENDPOINTS, no lock held.
+    // SAFETY: single-CPU, IRQs off; raw access to DOMAINS/ENDPOINTS/DOMAIN_MAPS, no lock held.
     unsafe {
         if d < MAX_DOMAINS {
             (*core::ptr::addr_of_mut!(DOMAINS)).tables[d] = EMPTY_TABLE;
@@ -692,6 +749,30 @@ pub fn reap_domain(domain: u16, task_idx: u16) {
         for slot in eps.iter_mut() {
             if slot.state != EpState::Idle && slot.peer_task == task_idx {
                 *slot = EP_EMPTY;
+            }
+        }
+        // INC7c reap teardown: UNMAP the dead domain's granted DQ_MAP/X_MAP pages, closing the
+        // lingering write-anywhere-DMA window. Frames are NOT freed here — they are object-owned
+        // (the live device rings / an extent's pinned data frame) and reclaimed at object-destroy
+        // (deferred), exactly as the shared objects survive the CapTable clear above.
+        if d < MAX_DOMAINS {
+            let dm = &mut (*core::ptr::addr_of_mut!(DOMAIN_MAPS))[d];
+            if dm.count > 0 {
+                let hhdm = crate::memory::hhdm_offset();
+                let total = dm.count;
+                let mut unmapped = 0usize;
+                let mut k = 0usize;
+                while k < total {
+                    if crate::paging::unmap_page(hhdm, dm.entries[k].va) {
+                        unmapped += 1;
+                    }
+                    k += 1;
+                }
+                dm.count = 0;
+                crate::serial_println!(
+                    "reap: domain {} torn down — unmapped {}/{} granted page(s) (frames object-owned, freed at object-destroy)",
+                    d, unmapped, total
+                );
             }
         }
     }
@@ -865,7 +946,7 @@ pub fn create_device_queue(magic: u64, scratch_lba: u64) -> Option<u16> {
 /// bytes must already be loaded into a RAM frame (`objstore::load_extent`, recorded as
 /// `data_frame_phys`); X_MAP performs NO I/O. The mapping is read-only (the persisted extent is
 /// immutable) and NX. MAP was enforced by the `extra` gate. Returns ErrMethod if not loaded.
-fn extent_map(oid: u64) -> (Status, u64) {
+fn extent_map(domain: usize, oid: u64) -> (Status, u64) {
     let i = oid as usize;
     if i >= OBJECT_TABLE_SIZE {
         return (Status::ErrBadCPtr, 0);
@@ -877,6 +958,10 @@ fn extent_map(oid: u64) -> (Status, u64) {
     }
     let hhdm = crate::memory::hhdm_offset();
     if crate::paging::map_user_phys(hhdm, EXTENT_MAP_BASE, frame, false, false, false) {
+        // Record for unmap-on-reap. The frame itself is OBJECT-owned (pinned by
+        // EXTENTS[oid].data_frame_phys for the extent's lifetime — other holders may still
+        // X_MAP it), so reap must NOT free it; freed at object-destroy (deferred).
+        record_domain_map(domain, EXTENT_MAP_BASE);
         (Status::Ok, EXTENT_MAP_BASE)
     } else {
         (Status::ErrMethod, 0)
@@ -902,7 +987,7 @@ fn devqueue_qsize(oid: u64) -> u64 {
 /// SECURITY (no IOMMU + one shared address space): a writable mapped ring frame is
 /// write-anywhere DMA AND reachable by every ring-3 task — this is granted ONLY to a trusted
 /// driver domain, enforced by capability distribution, not the MMU (see docs/PHASE3.md).
-fn devqueue_map(oid: u64) -> (Status, u64) {
+fn devqueue_map(domain: usize, oid: u64) -> (Status, u64) {
     let i = oid as usize;
     if i >= OBJECT_TABLE_SIZE {
         return (Status::ErrBadCPtr, 0);
@@ -913,16 +998,23 @@ fn devqueue_map(oid: u64) -> (Status, u64) {
         return (Status::ErrMethod, 0); // not a seeded device queue
     }
     let hhdm = crate::memory::hhdm_offset();
-    let ok = crate::paging::map_user_phys(hhdm, DQ_BASE, m.desc_phys, true, false, false)
-        && crate::paging::map_user_phys(hhdm, DQ_BASE + 0x1000, m.avail_phys, true, false, false)
-        && crate::paging::map_user_phys(hhdm, DQ_BASE + 0x2000, m.used_phys, false, false, false)
-        && crate::paging::map_user_phys(hhdm, DQ_BASE + 0x3000, m.buf_phys, true, false, false)
-        && crate::paging::map_user_phys(hhdm, DQ_BASE + 0x4000, m.doorbell_phys, true, false, true);
-    if ok {
-        (Status::Ok, DQ_BASE)
-    } else {
-        (Status::ErrMethod, 0)
+    // (VA, phys, writable, no_cache) for the 5 contiguous pages. used is RO; doorbell NO_CACHE.
+    let pages = [
+        (DQ_BASE, m.desc_phys, true, false),
+        (DQ_BASE + 0x1000, m.avail_phys, true, false),
+        (DQ_BASE + 0x2000, m.used_phys, false, false),
+        (DQ_BASE + 0x3000, m.buf_phys, true, false),
+        (DQ_BASE + 0x4000, m.doorbell_phys, true, true),
+    ];
+    for &(va, phys, writable, nc) in pages.iter() {
+        if !crate::paging::map_user_phys(hhdm, va, phys, writable, false, nc) {
+            return (Status::ErrMethod, 0);
+        }
+        // Record for unmap-on-reap. These frames are DEVICE-owned (the global virtio driver's
+        // real rings/buffer + the MMIO doorbell), so reap unmaps but NEVER frees them.
+        record_domain_map(domain, va);
     }
+    (Status::Ok, DQ_BASE)
 }
 
 /// `DQ_REPORT` work arm (v0 proof channel): a ring-3 driver reports the first 8 bytes it read
