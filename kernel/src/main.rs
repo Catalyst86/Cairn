@@ -535,7 +535,28 @@ unsafe extern "C" fn kmain_main() -> ! {
             // 2. Build the DeviceQueue cap (snapshots queue-0 phys layout + the proof state).
             let dq_root = capspace::create_device_queue(DQ_MAGIC, DQ_SCRATCH_LBA);
             if let (true, Some(dqd), Some(dq_root)) = (seeded, dqd, dq_root) {
-                // 3. Clear the shared data buffer to a sentinel, then bake the I/O params into
+                // 3. Delegate the cap: WITH MAP into the trusted driver domain (slot 0 -> RDI),
+                //    and a MAP-masked copy (INVOKE|READ|WRITE, no MAP) into the transient domain 3
+                //    — used for BOTH the DQ_MAP negative test and the DQ_SUBMIT fallback test.
+                let dq_drv = capspace::delegate_from_root(
+                    DRIVER_DOMAIN, dq_root,
+                    Rights::INVOKE | Rights::READ | Rights::WRITE | Rights::MAP, 0,
+                );
+                let dq_nomap = capspace::delegate_from_root(
+                    3, dq_root, Rights::INVOKE | Rights::READ | Rights::WRITE, 0,
+                );
+                // 4. DQ_SUBMIT (escalation-ladder v1): the MAP-less cap CANNOT DQ_MAP (no
+                //    write-anywhere ring) but CAN do kernel-mediated, DMA-contained I/O — the
+                //    kernel reads the seeded sector into its OWN buffer and returns the content
+                //    hash. Run BEFORE the sentinel-clear: DQ_SUBMIT reuses the shared virtio
+                //    buffer, which step 5 then resets for the driver's zero-syscall proof.
+                let expected = objstore::fnv1a(&seed);
+                let sub = dq_nomap.map(|c| capspace::cap_invoke_in(3, c, capspace::DQ_SUBMIT, DQ_SCRATCH_LBA));
+                serial_println!(
+                    "devqueue: MAP-less cap DQ_SUBMIT(LBA {}) => {:?} (kernel-mediated, DMA-contained); content-hash match={}",
+                    DQ_SCRATCH_LBA, sub, sub == Some((Status::Ok, expected))
+                );
+                // 5. Clear the shared data buffer to a sentinel, then bake the I/O params into
                 //    the buffer tail (buf_phys+2048) — both via the kernel HHDM alias. SAFETY:
                 //    single-CPU, IRQs off; the buffer frame is live device RAM we own pre-sti.
                 unsafe {
@@ -547,17 +568,8 @@ unsafe extern "C" fn kmain_main() -> ! {
                     p.add(2).write_unaligned(dqd.qsize as u64);
                     p.add(3).write_unaligned(dqd.doorbell_phys & 0xfff); // doorbell sub-page offset
                 }
-                // 4. Delegate the cap into the driver domain (slot 0 -> RDI) WITH MAP, and a
-                //    MAP-masked copy into the transient domain 3 for the negative test.
-                let dq_drv = capspace::delegate_from_root(
-                    DRIVER_DOMAIN, dq_root,
-                    Rights::INVOKE | Rights::READ | Rights::WRITE | Rights::MAP, 0,
-                );
-                let dq_nomap = capspace::delegate_from_root(
-                    3, dq_root, Rights::INVOKE | Rights::READ | Rights::WRITE, 0,
-                );
                 if let Some(dqc) = dq_drv {
-                    // 5. DQ_MAP via the verified invoke (FIRST live Rights::MAP); negative test:
+                    // 6. DQ_MAP via the verified invoke (FIRST live Rights::MAP); negative test:
                     //    a MAP-masked copy is refused DQ_MAP (ErrRights).
                     let (mst, base) = capspace::cap_invoke_in(DRIVER_DOMAIN, dqc, capspace::DQ_MAP, 0);
                     let deny = dq_nomap.map(|c| capspace::cap_invoke_in(3, c, capspace::DQ_MAP, 0).0);

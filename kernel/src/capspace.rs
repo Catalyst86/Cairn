@@ -81,11 +81,15 @@ pub const EXTENT_MAP_BASE: u64 = 0x110_0000;
 /// rings + a NO_CACHE doorbell page contiguously into the calling (trusted driver) domain at
 /// [`DQ_BASE`] and returns that base USER VA; `DQ_REPORT` (needs INVOKE|WRITE) is the v0
 /// proof channel — a ring-3 driver reports its zero-syscall I/O result and the kernel
-/// validates it against the seeded expectation (NOT a kernel-mediated submit — that v1
-/// fallback is deferred, see docs/PHASE3.md). Methods are per-kind, so 1/2/3 reuse is fine.
+/// validates it against the seeded expectation. `DQ_SUBMIT` (needs INVOKE|WRITE) is the
+/// **kernel-mediated, DMA-contained** fallback (escalation-ladder v1): the kernel performs the
+/// block read itself into its OWN buffer — never a domain-named frame — and returns the bytes'
+/// content hash, so an UNTRUSTED domain (a `DeviceQueue` cap WITHOUT `MAP`) gets safe I/O
+/// without the write-anywhere-DMA exposure of `DQ_MAP`. Methods are per-kind, so id reuse is fine.
 pub const DQ_INFO: u16 = 1;
 pub const DQ_MAP: u16 = 2;
 pub const DQ_REPORT: u16 = 3;
+pub const DQ_SUBMIT: u16 = 4;
 
 /// Fixed USER virtual-address base of the DeviceQueue mapping window (INC7). Five contiguous
 /// pages from here: +0x0000 desc (RW), +0x1000 avail (RW), +0x2000 used (RO — the device
@@ -391,6 +395,7 @@ fn dispatch_method(domain: usize, kind: ObjectKind, oid: u64, rights: Rights, me
         (ObjectKind::DeviceQueue, DQ_INFO) => Rights::READ,
         (ObjectKind::DeviceQueue, DQ_MAP) => Rights::MAP, // FIRST live use of Rights::MAP (INC7)
         (ObjectKind::DeviceQueue, DQ_REPORT) => Rights::WRITE,
+        (ObjectKind::DeviceQueue, DQ_SUBMIT) => Rights::WRITE,
         _ => Rights::empty(),
     };
     if !rights.contains(extra) {
@@ -444,6 +449,7 @@ fn dispatch_method(domain: usize, kind: ObjectKind, oid: u64, rights: Rights, me
         (ObjectKind::DeviceQueue, DQ_INFO) => (Status::Ok, devqueue_qsize(oid)),
         (ObjectKind::DeviceQueue, DQ_MAP) => devqueue_map(domain, oid),
         (ObjectKind::DeviceQueue, DQ_REPORT) => devqueue_report(oid, arg),
+        (ObjectKind::DeviceQueue, DQ_SUBMIT) => devqueue_submit(oid, arg),
         // Extent X_WRITE/X_COMMIT: WRITE was enforced above, but the content-addressed write
         // path needs the bytes, which arrive via Extent MAP in INC7. So a rights-valid write
         // falls through to ErrMethod here (the rights gate is proven; the write path is not
@@ -1033,6 +1039,33 @@ fn devqueue_report(oid: u64, reported: u64) -> (Status, u64) {
         m.scratch_lba, reported, m.magic, matched
     );
     (Status::Ok, matched as u64)
+}
+
+/// `DQ_SUBMIT` work arm (escalation-ladder v1, kernel-mediated + DMA-contained): read block
+/// `lba` and return the bytes' FNV-1a content hash. The kernel reads into its OWN buffer (the
+/// L2 `read_sector` path) — NEVER a domain-named frame — so an untrusted domain (a DeviceQueue
+/// cap with WRITE but no MAP) gets safe block I/O without the write-anywhere-DMA exposure of
+/// `DQ_MAP`. WRITE was enforced by the `extra` gate. `lba` is `arg0`; an out-of-range/failed read
+/// returns `ErrMethod`.
+///
+/// v0 NOTE: uses the single global queue 0, so it must NOT run concurrently with a `DQ_MAP`-ed
+/// trusted driver that owns the queue (the demo invokes it pre-`sti`). Per-queue isolation /
+/// serialization for concurrent runtime use is deferred (multi-queue + the IRQ/`DQ_SUBMIT` work).
+fn devqueue_submit(oid: u64, lba: u64) -> (Status, u64) {
+    let i = oid as usize;
+    if i >= OBJECT_TABLE_SIZE {
+        return (Status::ErrBadCPtr, 0);
+    }
+    // SAFETY: single-CPU, IRQs off; `i` bounds-checked; shared read of DEVQUEUES (presence only).
+    let present = unsafe { (*core::ptr::addr_of!(DEVQUEUES))[i].buf_phys != 0 };
+    if !present {
+        return (Status::ErrMethod, 0); // not a seeded device queue
+    }
+    let mut sect = [0u8; 512];
+    if !crate::virtio_blk::read_sector(lba, &mut sect) {
+        return (Status::ErrMethod, 0); // out-of-range / device error
+    }
+    (Status::Ok, crate::objstore::fnv1a(&sect))
 }
 
 /// Admission gate: the ROOT-domain cap at `cptr` must validate via the VERIFIED
